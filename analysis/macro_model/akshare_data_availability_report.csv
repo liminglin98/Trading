@@ -1,0 +1,21 @@
+﻿category,item,status,start,rows,cols,note
+Momentum,CSI300 index (sina),AVAILABLE,2002-01-04,5932,"date,open,high,low,close,volume","000300 OHLC, long history"
+Momentum,SSE50 index (sina),AVAILABLE,2004-01-02,5454,"date,open,high,low,close,volume","000016 OHLC, long history"
+Momentum,50ETF 510050 (sina),AVAILABLE,2005-02-23,5182,"date,prevclose,open,high,low,close,volume,amount","sina, unadjusted; eastmoney blocked"
+Momentum,300ETF 510300 (sina),AVAILABLE,2012-05-28,3417,"date,open,high,low,close,volume,amount","sina, unadjusted; eastmoney blocked"
+Momentum,"CSI300 index (em, optional)",ERROR,,,,"needs proxy; sina index already covers OHLC :: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+Valuation,CSI300 PE (legulegu),AVAILABLE,2005-04-08,5150,"日期,指数,等权静态市盈率,静态市盈率,静态市盈率中位数,等权滚动市盈率,滚动市盈率,滚动市盈率中位数",index PE TTM history
+Valuation,SSE50 PE (legulegu),AVAILABLE,2005-01-05,5210,"日期,指数,等权静态市盈率,静态市盈率,静态市盈率中位数,等权滚动市盈率,滚动市盈率,滚动市盈率中位数",index PE TTM history
+Valuation,CSI300 PB (legulegu),AVAILABLE,2005-04-08,5150,"日期,指数,市净率,等权市净率,市净率中位数",index PB history
+Liquidity,SSE margin (RZRQ),AVAILABLE,2018-03-21,2000,"信用交易日期,融资余额,融资买入额,融券余量,融券余量金额,融券卖出量,融资融券余额",Shanghai financing+lending balance
+Liquidity,SZSE margin (RZRQ),AVAILABLE,(no date col),1,"融资买入额,融资余额,融券卖出量,融券余量,融券余额,融资融券余额",Shenzhen snapshot @ 20260617; SSE series is primary
+Liquidity,Northbound flow (em),AVAILABLE,2014-11-17,2693,"日期,当日成交净买额,买入成交额,卖出成交额,历史累计净买额,当日资金流入,当日余额,持股市值",WARN curtailed since 2024-08
+Liquidity,Social financing (TSF),AVAILABLE,?,136,"月份,社会融资规模增量,其中-人民币贷款,其中-委托贷款外币贷款,其中-委托贷款,其中-信托贷款,其中-未贴现银行承兑汇票,其中-企业债券",monthly aggregate financing
+Liquidity,SHIBOR all tenors,AVAILABLE,2015-05-08,2305,"日期,O/N-定价,O/N-涨跌幅,1W-定价,1W-涨跌幅,2W-定价,2W-涨跌幅,1M-定价",O/N..1Y SHIBOR; secondary (have FR007)
+Sentiment,50ETF QVIX,AVAILABLE,2015-02-09,2751,"date,open,high,low,close",50ETF QVIX (renamed index_option_*)
+Sentiment,300ETF QVIX,AVAILABLE,2015-02-09,2751,"date,open,high,low,close",300ETF QVIX (renamed index_option_*)
+CrossAsset,China+US treasury yields,AVAILABLE,2010-01-04,4392,"日期,中国国债收益率2年,中国国债收益率5年,中国国债收益率10年,中国国债收益率30年,中国国债收益率10年-2年,中国GDP年增率,美国国债收益率2年",has China 10Y (-> ERP) and US 10Y
+CrossAsset,USDCNY central parity,AVAILABLE,1994-01-01,7988,"日期,美元,欧元,日元,港元,英镑,澳元,新西兰元",SAFE central parity history
+CrossAsset,S&P500 (sina),AVAILABLE,2004-01-02,5654,"date,open,high,low,close,volume,amount",global risk proxy
+CrossAsset,"VIX (sina, optional)",ERROR,,,,OPTIONAL; sina .VIX often fails; S&P already covers risk :: IndexError: list index out of range
+CrossAsset,Gold SGE spot,AVAILABLE,2016-12-19,2304,"date,open,close,low,high",gold proxy

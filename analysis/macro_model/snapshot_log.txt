@@ -1,0 +1,17 @@
+D:\My Drive\Trading\analysis\macro_model\pipeline.py:26: SyntaxWarning: invalid escape sequence '\.'
+  RUN IN A NORMAL PYTHON ENV from inside macro_model\.
+loaded IV cache: 308 dates
+======================================================================
+EOD SNAPSHOT  2026-06-23 14:46:33
+======================================================================
+  butterfly enetered 6.23 @ 2026-06-23 14:03:31 -> already logged for 2026-06-22
+D:\My Drive\Trading\analysis\macro_model\pipeline.py:26: SyntaxWarning: invalid escape sequence '\.'
+  RUN IN A NORMAL PYTHON ENV from inside macro_model\.
+loaded IV cache: 308 dates
+======================================================================
+EOD SNAPSHOT  2026-06-23 15:35:03
+======================================================================
+  butterfly enetered 6.23 @ 2026-06-23 14:03:31 -> already logged for 2026-06-22
+----------------------------------------------------------------------
+No TP/SL/roll alerts this run.
+======================================================================

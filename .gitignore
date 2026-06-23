@@ -1,0 +1,34 @@
+# =============================================================================
+# Whitelist .gitignore -- the Trading drive is huge (vnpy wheels, raw data,
+# economic-calendar xlsx, PDFs). We commit ONLY what the Streamlit app needs:
+#   - the macro_model app + its module siblings + cached model outputs
+#   - the single factor-panel CSV the app reads at startup
+#   - deploy config (requirements.txt, .streamlit/, README)
+# Everything else is ignored by default.
+# =============================================================================
+
+# Ignore everything at the repo root by default
+/*
+
+# --- top-level files / config we DO want ---
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/.streamlit/
+
+# --- the app lives under analysis/macro_model/ ---
+!/analysis/
+/analysis/*
+!/analysis/macro_model/
+
+# --- the one data file the app reads at startup ---
+!/Data/
+/Data/*
+!/Data/akshare/
+/Data/akshare/*
+!/Data/akshare/panel_monthly.csv
+
+# --- noise / large files to keep OUT even inside the whitelisted app folder ---
+analysis/macro_model/__pycache__/
+analysis/macro_model/**/*.pyc
+analysis/macro_model/out/iv_raw_by_date.pkl

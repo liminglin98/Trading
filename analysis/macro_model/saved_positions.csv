@@ -1,0 +1,4 @@
+saved_at,name,position_id,side,type,strike,qty,entry,expiry,spot_at_save,dte_at_save,cost_basis,mark_at_save,pnl_at_save
+2026-06-23 14:03:31,butterfly enetered 6.23,butterfly enetered 6.23 @ 2026-06-23 14:03:31,Buy,C,2.9,1,0.1424,2026-07-22,3.016,34,0.0752,0.0865,0.0113
+2026-06-23 14:03:31,butterfly enetered 6.23,butterfly enetered 6.23 @ 2026-06-23 14:03:31,Sell,C,3.1,2,0.0372,2026-07-22,3.016,34,0.0752,0.0865,0.0113
+2026-06-23 14:03:31,butterfly enetered 6.23,butterfly enetered 6.23 @ 2026-06-23 14:03:31,Buy,C,3.4,1,0.0072,2026-07-22,3.016,34,0.0752,0.0865,0.0113

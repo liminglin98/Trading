@@ -1,0 +1,8 @@
+strategy,expiry,entry_date,side,type,strike,qty,entry
+butterfly,2607,2026-06-23,Buy,C,2.85,1,0.1767
+butterfly,2607,2026-06-23,Sell,C,3.0,2,0.0728
+butterfly,2607,2026-06-23,Buy,C,3.3,1,0.0088
+condor,2607,2026-06-23,Buy,P,2.8,1,0.011
+condor,2607,2026-06-23,Sell,P,2.9,1,0.0271
+condor,2607,2026-06-23,Sell,C,3.2,1,0.0157
+condor,2607,2026-06-23,Buy,C,3.4,1,0.0066

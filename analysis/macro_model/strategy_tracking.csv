@@ -1,0 +1,3 @@
+strategy,expiry,entry_date,recorded_at,asof_date,spot,dte,cost_basis,mark,pnl
+butterfly,2607,2026-06-23,2026-06-23 22:57:27,2026-06-23,3.005,29,0.0399,0.0399,-0.0
+condor,2607,2026-06-23,2026-06-23 22:57:27,2026-06-23,3.005,29,-0.0252,-0.0252,-0.0
