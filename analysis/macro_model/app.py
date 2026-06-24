@@ -45,22 +45,51 @@ R_FREE = B.R_FREE
 # =============================================================================
 # Cached heavy builds (cleared by the refresh buttons)
 # =============================================================================
+# -----------------------------------------------------------------------------
+# Precomputed snapshot (see precompute.py). A daily local job runs the heavy
+# model fit + SSE IV fetches OFFLINE (where the Chinese feeds are reachable) and
+# pickles the whole app state to out/app_snapshot.pkl, then git-pushes it. When
+# the file is present the app just READS it -- so cold starts are instant and the
+# website never depends on a live fetch. If it's missing (e.g. local dev with no
+# snapshot yet) every loader falls back to building live, exactly as before.
+# -----------------------------------------------------------------------------
+SNAPSHOT_PATH = Path(__file__).resolve().parent / "out" / "app_snapshot.pkl"
+
+def _read_snapshot():
+    try:
+        import pickle
+        with open(SNAPSHOT_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
 @st.cache_data(show_spinner="Building contexts (model fit + SSE IV chain)...")
 def load_contexts():
+    snap = _read_snapshot()
+    if snap is not None:
+        return (snap["contexts"], snap["etf"], snap["last_daily"],
+                snap["X"], snap["y"], snap["df"])
     contexts, etf, last_daily, X, y, df = PS.build_contexts()
     return contexts, etf, last_daily, X, y, df
 
 @st.cache_data(show_spinner="Fetching the latest 50ETF close...")
 def load_etf_fresh(stamp):
-    # The daily ETF close series, re-pulled on every new day (sina is always
-    # fresh + fast). Kept SEPARATE from the heavy load_contexts() cache so the
-    # live spot/tracker no longer freeze at the price from the first cache build.
+    # Prefer the precomputed daily ETF close; otherwise re-pull live (sina is
+    # always fresh + fast). Kept SEPARATE from load_contexts() so the live
+    # spot/tracker don't freeze at the price from the first cache build.
+    snap = _read_snapshot()
+    if snap is not None and snap.get("etf_fresh") is not None:
+        return snap["etf_fresh"]
     return TK.load_etf()
 
 @st.cache_data(show_spinner="Fetching the most recent chain for the live spec...")
 def load_live_context(stamp):
-    # `stamp` (a date string) is part of the cache key so the live chain AND the
-    # daily ETF close are re-fetched on a new day; refresh buttons also clear it.
+    # `stamp` (a date string) is part of the cache key so a new day re-reads the
+    # snapshot / re-fetches; refresh buttons also clear it. Prefer the precomputed
+    # live context; only fetch live when there's no snapshot.
+    snap = _read_snapshot()
+    if snap is not None and snap.get("live_ctx") is not None:
+        return snap["live_ctx"], bool(snap.get("live", True))
     contexts, etf, last_daily, X, y, df = load_contexts()
     etf_fresh = load_etf_fresh(stamp)            # fresh spot, not the frozen one
     ctx = WX.build_live_context(etf_fresh, X, y)
@@ -338,6 +367,59 @@ with tab1:
                    "capping the tail. Friction (~bid/ask + commission) is not in these "
                    "marks; the backtest module charges it explicitly.")
 
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # STRATEGY 3 -- iron condor income sleeve (conservative, realistic ~6%/yr)
+    # -------------------------------------------------------------------------
+    st.subheader("3. Iron condor income sleeve  --  conservative, realistic ~6%/yr target")
+    c10m = int(TK.STRAT_DEFAULTS["condor10_m"]); c10p = int(TK.STRAT_DEFAULTS["condor10_p"])
+    csp10 = live_condor_spec(ctx, c10m, c10p)
+    if csp10 is None:
+        st.warning("Could not build the income condor (protective wings run off the listed grid).")
+    else:
+        frac = float(TK.CONDOR10_FRACTION)
+        st.markdown("**Parameters**")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("short strikes", f"{c10m} steps OTM (~20 delta)")
+        q2.metric("protective wings", f"{c10p} steps further")
+        q3.metric("sizing budget", f"{frac:.0%} of bankroll / trade")
+        q4.metric("backtest target", f"~{TK.CONDOR10_TARGET_RETURN:.0%}/yr")
+
+        st.markdown("**Current holdings suggestion**")
+        cd10_lots = int(frac * bankroll / csp10["max_loss"]) if csp10["max_loss"] > 0 else 0
+        st.dataframe(leg_table(csp10["legs_df"]),
+                     use_container_width=True, hide_index=True)
+
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("spot", f"{csp10['spot']:.3f}")
+        e2.metric("net credit (max profit)", f"{csp10['credit']:.4f}")
+        e3.metric("max loss", f"{csp10['max_loss']:.4f}")
+        e4.metric("DTE", f"{csp10['dte']}")
+        e1.metric("short put / call", f"{csp10['kp_short']:.3f} / {csp10['kc_short']:.3f}")
+        e2.metric("long put / call", f"{csp10['kp_long']:.3f} / {csp10['kc_long']:.3f}")
+        e3.metric("profit zone", f"[{csp10['kp_short']:.3f}, {csp10['kc_short']:.3f}]")
+        e4.metric(f"size @ {frac:.0%} budget", f"{cd10_lots} lots")
+
+        Sc10 = np.linspace(csp10["spot"]*0.80, csp10["spot"]*1.20, 241)
+        payoff_c10 = IC.payoff_condor(Sc10, csp10["strikes"], csp10["credit"])
+        fig3, ax3 = plt.subplots(figsize=(8, 3.6))
+        ax3.plot(Sc10, payoff_c10, color="#00897b", lw=1.8)
+        ax3.axhline(0, color="grey", lw=0.7)
+        ax3.axvline(csp10["spot"], color="#c0392b", lw=1, ls="--", label="spot")
+        ax3.axvspan(csp10["kp_short"], csp10["kc_short"], color="#2e7d32", alpha=0.10,
+                    label="profit zone (short strikes)")
+        ax3.set_xlabel("50ETF at expiry"); ax3.set_ylabel("P&L per 1-lot"); ax3.legend()
+        ax3.set_title("Income condor payoff at expiry")
+        st.pyplot(fig3)
+        st.info("Reality check (out/condor10_spec.json): a passive monthly 50ETF condor "
+                "caps near **5-6%/yr after costs** at this drawdown budget (~-35% MDD). "
+                "10%/yr is only reachable by selling near-the-money at near-Kelly sizing "
+                "(~-70% drawdowns), so this sleeve targets the realistic ~6%. Backtest at "
+                "the 12% sizing budget: flat-vol+slippage ~5.8% CAGR / 80% win; real skew "
+                "is thinner. A genuine 10% would need the VRP timing gate (sell only when "
+                "implied >= model vol) -- still to be validated.")
+
 # =============================================================================
 # TAB 2 -- holdings P&L (manual leg entry)
 # =============================================================================
@@ -538,7 +620,9 @@ with tab_track:
     etf_fresh = load_etf_fresh(stamp)
     track_params = dict(bfly_wing=int(band_wing),
                         condor_m=int(TK.STRAT_DEFAULTS["condor_m"]),
-                        condor_p=int(TK.STRAT_DEFAULTS["condor_p"]))
+                        condor_p=int(TK.STRAT_DEFAULTS["condor_p"]),
+                        condor10_m=int(TK.STRAT_DEFAULTS["condor10_m"]),
+                        condor10_p=int(TK.STRAT_DEFAULTS["condor10_p"]))
 
     cbtn, cinfo = st.columns([1, 2])
     if cbtn.button("Record snapshot now (both strategies)", use_container_width=True):
@@ -548,9 +632,12 @@ with tab_track:
         st.rerun()
     cinfo.caption(f"butterfly wing = {band_wing} steps (model band)  |  "
                   f"condor = {track_params['condor_m']} steps OTM, "
-                  f"{track_params['condor_p']}-step wings")
+                  f"{track_params['condor_p']}-step wings  |  "
+                  f"income condor = {track_params['condor10_m']} steps OTM, "
+                  f"{track_params['condor10_p']}-step wings (~6%/yr sleeve)")
 
-    STRAT_COLOR = {"butterfly": "#1f4e79", "condor": "#6a1b9a"}
+    STRAT_COLOR = {"butterfly": "#1f4e79", "condor": "#6a1b9a",
+                   "condor10": "#00897b"}
     track = TK.load_strategy_tracking()
 
     if not len(track):

@@ -614,11 +614,24 @@ def snapshot_all_open(only_open=True, etf=None, underlying="510050"):
 STRAT_ENTRY_PATH = HERE / "strategy_entries.csv"
 STRAT_TRACK_PATH = HERE / "strategy_tracking.csv"
 
-STRATEGIES = ("butterfly", "condor")
+STRATEGIES = ("butterfly", "condor", "condor10")
 # Default structure parameters. butterfly wing is overridden by the model band
 # when the snapshot is taken from the dashboard / pipeline (which pass bfly_wing
 # = WX.model_band_wing(contexts)); the defaults here are the standalone fallback.
-STRAT_DEFAULTS = dict(bfly_wing=3, condor_m=2, condor_p=2)
+#   condor    -- aggressive front-month VRP condor (shorts 2 steps OTM, 2-step wings)
+#   condor10  -- conservative income sleeve: edge-bearing ~1-sigma (~20-delta) shorts
+#                with wider (3-step) protective wings, sized small (CONDOR10_FRACTION
+#                of bankroll/trade) to a ~-35% max-drawdown budget. A passive monthly
+#                50ETF condor caps near 5-6%/yr after costs at sane sizing, so this
+#                sleeve targets the realistic ~6% (not 10%). See out/condor10_spec.json.
+STRAT_DEFAULTS = dict(bfly_wing=3, condor_m=2, condor_p=2,
+                      condor10_m=2, condor10_p=3)
+
+# condor10 sizing: bankroll fraction risked per trade (max-loss based) and the
+# annualized return it delivered in the 2015-2026 backtest under the realistic
+# (flat-vol + slippage) case: f=0.12 -> ~5.8% CAGR, ~-35% MDD, 80% win.
+CONDOR10_FRACTION = 0.12
+CONDOR10_TARGET_RETURN = 0.06
 
 STRAT_ENTRY_COLS = ["strategy", "expiry", "entry_date",
                     "side", "type", "strike", "qty", "entry"]
@@ -626,7 +639,8 @@ STRAT_TRACK_COLS = ["strategy", "expiry", "entry_date", "recorded_at",
                     "asof_date", "spot", "dte", "cost_basis", "mark", "pnl"]
 
 STRAT_LABEL = {"butterfly": "Long call butterfly",
-               "condor": "Iron condor (short vol, defined risk)"}
+               "condor": "Iron condor (short vol, defined risk)",
+               "condor10": "Iron condor 10%-target (income sleeve, ~6% realistic)"}
 
 
 # ---- structure builders (priced off the live smile, same BS as everything else)
@@ -676,6 +690,9 @@ def build_strategy_legs(strategy, smile, spot, T, params=None):
     if strategy == "condor":
         return build_condor_legs(smile, spot, T, int(params["condor_m"]),
                                  int(params["condor_p"]))
+    if strategy == "condor10":
+        return build_condor_legs(smile, spot, T, int(params["condor10_m"]),
+                                 int(params["condor10_p"]))
     return None
 
 

@@ -1,0 +1,26 @@
+{
+  "name": "condor10",
+  "label": "Iron condor income sleeve (realistic ~6%/yr target)",
+  "geometry": {
+    "short_steps_OTM": 2,
+    "protective_steps": 3,
+    "approx_short_delta": 0.20,
+    "approx_short_OTM_pct": 5.0,
+    "wing_price_width": 0.15
+  },
+  "sizing": {
+    "bankroll_fraction_per_trade": 0.12,
+    "basis": "fraction of bankroll risked per trade (max-loss based)"
+  },
+  "target_annual_return": 0.06,
+  "calibration_sample": "50ETF 2015-02..2026-06, 135 monthly expiries, BS priced off QVIX",
+  "backtest_sensitivity_at_f_0.12": {
+    "flat_vol_no_cost":       {"mean_r_per_trade": 0.077,  "cagr": 0.101,  "note": "optimistic; ignores skew + costs"},
+    "flat_vol_plus_slippage": {"mean_r_per_trade": 0.049,  "cagr": 0.058,  "maxDD": -0.35, "win": 0.80, "note": "central realistic case -> the ~6% target"},
+    "real_skew_no_cost":      {"mean_r_per_trade": 0.006,  "cagr": -0.004, "note": "single steep-skew day; likely overstated"},
+    "real_skew_plus_slippage":{"mean_r_per_trade": -0.019, "cagr": -0.038, "note": "pessimistic bound"}
+  },
+  "kelly_ceiling_note": "Max achievable annualized CAGR at ANY sizing (flat+slippage): ~9% at 20-delta (maxDD -66%), ~11% at 25-delta (maxDD -75%). 10%/yr is NOT reachable at a sane drawdown; this sleeve sizes to a ~-35% MDD budget and accepts ~6%.",
+  "path_to_real_10pct": "Only a timing edge (the macro_model VRP gate: sell only when implied vol >= model vol) could lift the per-trade edge enough for 10% at sane sizing. Needs a rebuilt IV-history backtest to validate (cached IV pickles are currently empty).",
+  "disclaimer": "Analytics/suggestions only. Edge is thin and regime-dependent; past backtest is not a guarantee. No orders are placed."
+}
