@@ -15,3 +15,30 @@ EOD SNAPSHOT  2026-06-23 15:35:03
 ----------------------------------------------------------------------
 No TP/SL/roll alerts this run.
 ======================================================================
+ 
+==================== 06/24/2026 Wed 15:35:01.16 ==================== 
+D:\My Drive\Trading\analysis\macro_model\pipeline.py:28: SyntaxWarning: invalid escape sequence '\.'
+  RUN IN A NORMAL PYTHON ENV from inside macro_model\.
+loaded IV cache: 308 dates
+======================================================================
+EOD SNAPSHOT  2026-06-24 15:35:08
+======================================================================
+model strategies (butterfly + iron condor):
+built 49 month contexts; IV cache now 308 dates
+  butterfly -> already logged for 2026-06-23 (2607)
+  condor -> already logged for 2026-06-23 (2607)
+  condor10 -> logged pnl=+0.0001 spot=3.005 dte=29 (2607) asof 2026-06-23
+saved combinations:
+  butterfly enetered 6.23 @ 2026-06-23 14:03:31 -> logged pnl=+0.0025 spot=3.005 dte=29 asof 2026-06-23
+----------------------------------------------------------------------
+No TP/SL/roll alerts this run.
+======================================================================
+D:\My Drive\Trading\analysis\macro_model\precompute.py:11: SyntaxWarning: invalid escape sequence '\)'
+  Run (from inside macro_model\):
+loaded IV cache: 308 dates
+building contexts (model fit + SSE IV chain)...
+built 49 month contexts; IV cache now 308 dates
+pulling fresh 50ETF close...
+building live context (most recent chain)...
+wrote D:\My Drive\Trading\analysis\macro_model\out\app_snapshot.pkl
+  contexts: 49 months | live: True | built_at: 2026-06-24 15:35
