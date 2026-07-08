@@ -51,6 +51,7 @@ import pandas as pd
 INDEX_CSV = Path(__file__).resolve().parents[2] / "Data" / "index" / "index_daily_000001.csv"
 
 ER_WINDOWS = (10, 20, 40, 60)
+MOM_WINDOWS = {"1m": 21, "3m": 63, "6m": 126, "12m": 252}   # trading days
 
 
 def load_index() -> pd.Series:
@@ -73,8 +74,8 @@ def trend_signal_frame(s: pd.Series, windows: tuple[int, ...] = ER_WINDOWS) -> p
     out = pd.DataFrame(index=s.index)
     for n in windows:
         out[f"ER_{n}"] = efficiency_ratio(s, n)
-    out["mom_1m"] = s / s.shift(21) - 1
-    out["mom_3m"] = s / s.shift(63) - 1
+    for label, n in MOM_WINDOWS.items():
+        out[f"mom_{label}"] = s / s.shift(n) - 1
     out["px"] = s
     return out
 

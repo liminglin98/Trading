@@ -1,6 +1,6 @@
 # Delta-Targeted Iron Condor: Investigation Summary & Verdict
 
-**Bottom line: no robust, out-of-sample-defensible edge found.** Every management lever tested (early exit, rolling, entry duration, wing width, and — as of §3.7 — a mechanism-targeted trend/momentum mid-trade exit on the SSE Composite) either hurt performance outright or looked good only in-sample and failed when tested on data it hadn't seen. The apparent full-history edge is concentrated almost entirely in 2024-2026, which the data suggests was a lucky stretch (no tail events), not a structural improvement. Treat this construction as **unproven, likely negative-expectancy over a representative sample**, not a strategy ready to trade.
+**Bottom line: no robust, out-of-sample-defensible edge found.** Every management lever tested (early exit, rolling, entry duration, wing width, a mechanism-targeted trend/momentum mid-trade exit) either hurt performance outright or looked good only in-sample and failed when tested on data it hadn't seen. Two attempts to pair the condor with something else entirely — a far-OTM tail hedge (§3.8) and a separate trend-following sleeve on the SSE Composite (§3.9) — fared no better. The apparent full-history edge is concentrated almost entirely in 2024-2026, which the data suggests was a lucky stretch (no tail events), not a structural improvement. Treat this construction as **unproven, likely negative-expectancy over a representative sample**, not a strategy ready to trade.
 
 Scripts referenced below are all in this folder; each is independently runnable and documents its own method in its docstring.
 
@@ -18,9 +18,11 @@ Key scripts, roughly in the order they were written:
 - `condor_delta_dte_sweep.py` — same OOS discipline, applied to entry duration (target DTE).
 - `condor_delta_regime_diagnostic.py` — decomposes why the 2015-2023 vs 2024-2026 windows differ (VRP, realized vol, tail-loss frequency).
 - `condor_delta_wing_sweep.py` — same OOS discipline, applied to wing width (p).
-- `index_trend_signal.py` — reusable trend-persistence signal on the SSE Composite (000001), used by both of the below.
-- `condor_trend_exit_backtest.py` — the trend/momentum filter flagged as the one untested idea (§3.7).
+- `index_trend_signal.py` — reusable trend-persistence signal on the SSE Composite (000001), used by three of the below.
+- `condor_trend_exit_backtest.py` — the trend/momentum mid-trade exit filter (§3.7).
 - `sse_4000_level_read.py` — standalone (non-condor) read of the SSE Composite around the 4000 level.
+- `condor_tail_hedge_backtest.py` — a far-OTM options hedge bought alongside the condor (§3.8).
+- `condor_trend_sleeve_backtest.py` — a separate trend-following position on the SSE Composite, blended with the condor as a second sleeve rather than a rule on the condor itself (§3.9).
 
 ---
 
@@ -102,21 +104,48 @@ So the mechanism is real — a persistent grind on the broad index does show up 
 
 *(Separately, `sse_4000_level_read.py` produced a standalone, non-condor read of the SSE Composite around the round-number 4000 level: only 9 genuine crossings — persisting ≥5 trading days, not whipsaws — in the full 2010-2026 history, because the index spent 2015-07-27 to 2025-11-14 (~10.2 years) continuously below it. It's only been back above 4000 since early 2026, and the last ~18 months show 6 genuine crossings back and forth — i.e. real, active chop right at the level, not a decisive break either way as of 2026-07-08 (last close 3970.9, −0.73%). Descriptive only, not a trading signal.)*
 
+### 3.8 Tail hedge (far-OTM put + call bought alongside the condor) — mechanically different, still doesn't help
+
+Every lever above reacts to or modifies the condor's *own* position. A hedge is different in kind: a separate small position bought at entry, sized to pay off exactly when the condor's wings get blown through, with no mid-trade management at all. Tests buying one far-OTM put + one far-OTM call every month (independent monthly universe, same as `condor_delta_backtest.py`; target |delta| grid 0.03/0.05/0.08/0.10/0.15), priced off the same real quoted closes.
+
+**It is not cheap.** Even the smallest, most far-OTM hedge tested (0.03 delta) costs **27% of the condor's own credit, every month** — rising to 105%+ (more than the entire credit collected) at 0.15 delta. SSE 50ETF options carry a real volatility skew: far-OTM strikes are priced richer than flat-vol intuition suggests, precisely because everyone wants that same protection.
+
+- Discovery: every hedge size makes mean_r *worse* than the already-negative unhedged baseline (−0.47% → −4.44% at the cheapest hedge, down to −9.52% at the most expensive).
+- The frozen (cheapest, least-drag) pick fails OOS: holdout CAGR +13.58% → +0.00% (Kelly-rejected). Confirmed at a second entry config (+14.72% → 0%).
+- **Mechanistic check, worst 5 monthly-universe trades:** the tiny 0.03-delta hedge barely moves anything (too far out to be reached). A bigger, pricier 0.10-delta hedge (72-82% of credit) does meaningfully cut the single worst trade in the dataset (−98.6% → −67.4%) and one other large loss — but on 2 of the same 5 trades it just adds cost with zero payout, because that particular move never got far enough to reach even a 0.10-delta strike.
+
+**Verdict: same trade-off as the stop-loss roll and the trend-exit, just paid for in premium instead of a mid-trade rule** — selective insurance that only pays off in the specific window that contains a real blow-through, and costs money every other month. Does not survive OOS.
+
+### 3.9 Trend-following sleeve (separate position on the SSE Composite, not a rule on the condor) — the crash-alpha thesis, tested and it didn't show up here
+
+A genuinely different idea from everything above: instead of managing or hedging the condor, hold a **separate, independent position** on the SSE Composite that's expected to profit directly in the persistent-grind regimes that hurt the condor (4 of 5 disasters were violent rallies — a sleeve already long into that rally profits from it, rather than merely avoiding/cutting the condor's loss).
+
+Design (time-series momentum, monthly rebalance on the condor's own entry dates, unlevered 1x notional over the condor's own entry→exit window, blended into one portfolio return `w·condor_r + (1-w)·trend_r` before Kelly-sizing):
+- **Swept**: momentum lookback {1m, 3m, 6m, 12m} × condor/sleeve weight {100/0 baseline, 90/10, 80/20, 70/30, 60/40, 50/50}.
+- **Fixed by convention** (not tuned, to limit an already-bigger 2-parameter search): 0% deadband (plain sign of momentum), no vol-targeting, 0.10% round-trip cost.
+
+- Discovery: every cell lands within a hair of baseline; the "best" (1-month lookback, 50/50) only reaches −0.25% vs −0.47% baseline, and sits at the edge of the tested grid. Notably fragile: more trend allocation helps slightly at 1m/3m/12m lookbacks but *hurts* at 6m — no economic reason for that reversal, a classic overfitting tell.
+- Holdout: adding *any* trend allocation, at *every* lookback, made things monotonically worse — the frozen pick drops holdout CAGR from +13.58% to +7.15%. Confirmed at a second entry config (+14.72% → +11.75%).
+- **Mechanistic check, worst 5 monthly-universe trades:** the sleeve genuinely profited on only **1 of 5**. On the other 4 — including the single worst trade in the dataset (Dec 2022) — the sleeve *also lost money*, because a trailing-momentum signal was still reading the pre-rally trend right as a sharp, surprising reversal began: the textbook trend-following failure mode (whipsaw at turning points). Most of the apparent "improvement" on those trades is just the 50/50 blend halving the condor's own exposure, not the sleeve actually profiting opposite the loss.
+
+**Verdict: the crash-alpha thesis is directionally sound in principle but didn't materialize with this simple a design, on this instrument/period** — the disasters in this dataset are disproportionately sharp reversals, which is precisely where naive sign-of-momentum trend-following struggles most. Does not survive OOS.
+
 ## 4. What's actually established vs. still open
 
 **Established (high confidence, OOS-tested or mechanistically verified):**
-- Hold-to-expiry beats every exit/roll modification tested, including the trend/momentum-based mid-trade exit (§3.7) — the mechanism-targeted lever, not just generic parameter tweaks.
-- The stop-loss roll's apparent edge was in-sample overfitting to 5 specific historical tail events, not a stable rule; the trend-exit filter hits the identical trade-off (real disaster-cutting power, but indiscriminate enough to net negative OOS).
+- Hold-to-expiry beats every exit/roll modification tested, including the mechanism-targeted trend/momentum mid-trade exit (§3.7).
+- Pairing the condor with something structurally different — a far-OTM tail hedge (§3.8) or an independent trend-following sleeve (§3.9) — was tested properly and also failed OOS, so "combine with something else" is not automatically the fix either.
+- Every one of these hits variants of the same trade-off: a mechanism that would genuinely have helped the known disasters (stop-loss roll, trend-exit, tail hedge, trend sleeve) is either indiscriminate enough to cost more on ordinary months than it saves on rare ones, or — for the trend sleeve specifically — actively wrong-footed by the fact these disasters are mostly sharp reversals, not clean extended trends.
 - VRP (the core edge) is stable across periods; what varies is tail-event incidence, which is low-frequency and clustered, not smoothly distributed.
 - Wing width trades disaster severity against per-trade credit efficiency, and p=4's net effect on 2015-2023 aggregate expectancy is flat-to-negative.
-- **The construction has negative mean expectancy over the 9-year 2015-2023 window, under every exit/roll/DTE/wing-width/trend-filter variant tested.**
+- **The construction has negative mean expectancy over the 9-year 2015-2023 window, under every exit/roll/DTE/wing-width/trend-filter/hedge/trend-sleeve variant tested.**
 
 **Still open / not tested:**
 - Different entry delta targets (0.10-0.30 were swept pre-OOS-discipline, never re-validated with a proper split).
-- Multi-underlying diversification (510300/510500 chains exist locally, unused).
+- Multi-underlying diversification (510300/510500 chains exist locally, unused) — different from the trend sleeve above (that was a directional bet; this would be spreading the *same* condor structure across more, imperfectly-correlated underlyings, reducing idiosyncratic tail risk without introducing a new return stream).
+- A less naive trend signal (e.g. one that distinguishes a persistent grind from a sharp reversal, rather than plain sign-of-momentum) might behave differently on the specific reversal-type disasters here — untested, and would need its own honest OOS discipline given how easily this family of ideas overfits a 5-event sample.
 - Whether 2024-2026 is representative going forward is fundamentally unknowable from backtesting alone — it's one realization of a low-frequency tail process, not evidence the process changed.
-- With the trend-exit lever now also ruled out, no untested mechanism-targeted idea remains from this investigation; anything further would be a genuinely new construction (different underlying, different structure), not another lever on this one.
 
 ## 5. Recommendation
 
-Don't trade this construction on the strength of the full-sample or 2024-2026 numbers alone — they're propped up by the absence of a tail event that has occurred roughly once every two years historically. Every lever tested, including the mechanism-targeted trend/momentum filter (§3.7), either hurt outright or failed genuine OOS testing. At this point the construction itself — not its management — is the thing that's shown negative baseline expectancy on 9 years of data; further work should treat that as the open question, rather than searching for another overlay.
+Don't trade this construction on the strength of the full-sample or 2024-2026 numbers alone — they're propped up by the absence of a tail event that has occurred roughly once every two years historically. Every lever tested — mechanical exit/roll rules, a mechanism-targeted trend exit, a far-OTM tail hedge, and an independent trend-following sleeve — either hurt outright or failed genuine OOS testing. At this point the construction itself — not its management, and not what it's paired with — is the thing that's shown negative baseline expectancy on 9 years of data; further work should treat that as the open question (a different underlying, a different structure, or genuine multi-underlying diversification), rather than searching for another overlay on this one.
