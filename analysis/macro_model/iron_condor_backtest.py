@@ -17,7 +17,14 @@ Max loss   = wing width - credit (capped). Profits when the realized move is sma
 
 Each month-end t (no look-ahead):
   1. Train factor model on data <= t; draw next-month returns (scaled to option DTE).
-  2. Real SSE IV smile at t (option_risk_indicator_sse), OTM side, ~1m expiry.
+  2. IV smile at t from the LOCAL option-chain cache (Data/options/option_daily_
+     510050.csv, built daily by analysis/options_lab/updater.py from real Sina
+     quotes), OTM side, expiry closest to ~1m out. local_iv_smile() below replaces
+     butterfly_timing_backtest.fetch_iv_table/choose_expiry/otm_smile (which hit
+     SSE live over the network) for backtesting ONLY -- those three are untouched
+     and still used live by app.py/tracking.py for TODAY's data, since the
+     deployed Streamlit Cloud app has no access to this local cache (Data/options/
+     is gitignored, dev-machine only).
   3. Pick condor width (short strikes m steps OTM, protection p steps) by best model
      Kelly growth; trade only if model E[PnL] > 0 AND implied/model >= RATIO_GATE.
   4. Size at fractional Kelly on PnL/max-loss; realize at expiry from actual 50ETF.
@@ -26,13 +33,14 @@ Compare: model-filtered condor vs always-on condor vs buy & hold.
 Fees & slippage: SLIP_PER_LEG charged on all 4 entry legs; held to expiry (cash
 settle, no exit trade).
 
-RUN IN A NORMAL PYTHON ENV (internet; ~100 SSE calls). Needs the same deps +
-butterfly_timing_backtest.py and butterfly_factor_forecast.py alongside.
+RUN IN A NORMAL PYTHON ENV. No network calls -- reads the local option-chain +
+ETF caches under Data/options/ (run analysis/options_lab/updater.py first to
+accumulate/refresh them). Needs the same deps + butterfly_timing_backtest.py
+and butterfly_factor_forecast.py alongside.
 """
 
 from __future__ import annotations
 
-import time
 import warnings
 from pathlib import Path
 
@@ -46,17 +54,22 @@ warnings.filterwarnings("ignore")
 
 # reuse helpers (importing does not run their main())
 from butterfly_factor_forecast import load_panel, build_xy, fit_predict_conjugate, SPOT_COL
-from butterfly_timing_backtest import (
-    fetch_iv_table, otm_smile, choose_expiry, bs_call, bs_put, kelly_opt,
-    R_FREE, MIN_TRAIN,
-)
-import akshare as ak
+from butterfly_timing_backtest import bs_call, bs_put, kelly_opt, R_FREE, MIN_TRAIN
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 OUTDIR        = Path(__file__).resolve().parent / "out"
 OUTDIR.mkdir(exist_ok=True)
+
+UNDERLYING    = "510050"
+# Data/options/ lives at the repo root, two levels up from analysis/macro_model/.
+# Untracked/gitignored on purpose -- local accumulation only, see updater.py.
+DATA_DIR      = Path(__file__).resolve().parents[2] / "Data" / "options"
+CHAIN_CSV     = DATA_DIR / f"option_daily_{UNDERLYING}.csv"
+ETF_CSV       = DATA_DIR / f"etf_daily_{UNDERLYING}.csv"
+TARGET_DTE    = 30         # prefer the expiry closest to ~30 calendar days out
+MAX_LOOKBACK  = 7          # max days to step back looking for a cached trading day
 
 SLIP_PER_LEG  = 0.0008      # entry friction per leg (yuan/share): bid-ask+commission
 SHORT_STEPS   = [1, 2, 3]   # short strikes this many listed steps OTM (grid)
@@ -66,6 +79,70 @@ KELLY_FRAC    = 0.33        # fraction of full Kelly deployed
 KELLY_CAP     = 0.50        # cap on bankroll fraction at risk per trade
 ALWAYS_M      = 2           # always-on benchmark: fixed short distance (steps)
 FIXED_FRAC    = 0.10        # raw-VRP benchmark: risk this fixed % of bankroll every month
+
+
+# =============================================================================
+# Local data source (replaces live SSE fetch_iv_table/choose_expiry/otm_smile)
+# =============================================================================
+def load_local_chain() -> pd.DataFrame:
+    """Local option-chain cache -- same schema updater.py/data_store.py write,
+    read directly here (by design macro_model does not import options_lab code,
+    since only macro_model is part of the deployed/tracked app)."""
+    df = pd.read_csv(CHAIN_CSV, encoding="utf-8-sig", dtype={"合约代码": str})
+    df = df[~df["合约简称"].astype(str).str.endswith("A")]   # drop adjusted contracts
+    df["交易日期"] = pd.to_datetime(df["交易日期"])
+    df["到期日"] = pd.to_datetime(df["到期日"])
+    for col in ("行权价(元)", "距到期日剩余天数", "隐含波动率", "期权标的收盘价"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("交易日期")
+
+
+def load_local_etf() -> pd.Series:
+    df = pd.read_csv(ETF_CSV)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.set_index("date")["close"].sort_index()
+
+
+def local_iv_smile(chain: pd.DataFrame, trade_date: pd.Timestamp,
+                   target_dte: int = TARGET_DTE, max_back: int = MAX_LOOKBACK):
+    """Nearest cached trading day on/before trade_date; the listed expiry
+    closest to target_dte (skipping <=5 DTE, same rule as choose_expiry); OTM
+    smile (puts below spot, calls above -- same rule as otm_smile), built
+    straight off real DTE/expiry dates rather than reconstructing them from a
+    YYMM contract code.
+
+    Returns (entry_date, spot, smile, exp_date) or (None, None, None, None).
+    """
+    day, d = pd.DataFrame(), None
+    for back in range(max_back + 1):
+        d = trade_date - pd.Timedelta(days=back)
+        day = chain[chain["交易日期"] == d]
+        if not day.empty:
+            break
+    if day.empty:
+        return None, None, None, None
+
+    spot = float(day["期权标的收盘价"].iloc[0])
+    exp_info = day[["到期日", "距到期日剩余天数"]].drop_duplicates()
+    exp_info = exp_info[exp_info["距到期日剩余天数"] > 5]
+    if exp_info.empty:
+        return None, None, None, None
+    exp_info = exp_info.assign(
+        score=(exp_info["距到期日剩余天数"] - target_dte).abs())
+    exp_date = exp_info.sort_values("score").iloc[0]["到期日"]
+
+    sub = day[day["到期日"] == exp_date]
+    out = {}
+    for k in sorted(sub["行权价(元)"].unique()):
+        side = "P" if k < spot else "C"
+        row = sub[(sub["行权价(元)"] == k) & (sub["认购(C)认沽(P)类型"] == side)]
+        alt = sub[(sub["行权价(元)"] == k) & (sub["认购(C)认沽(P)类型"] != side)]
+        iv = row["隐含波动率"].mean() if len(row) else (
+            alt["隐含波动率"].mean() if len(alt) else np.nan)
+        if np.isfinite(iv) and iv > 0:
+            out[k] = iv
+    smile = pd.Series(out).sort_index()
+    return d, spot, smile, exp_date.date()
 
 # =============================================================================
 # Condor pricing / payoff
@@ -103,10 +180,9 @@ def run():
     X, y, used = build_xy(df)
     idx = X.index
 
-    etf = ak.fund_etf_hist_sina(symbol="sh510050")
-    etf["date"] = pd.to_datetime(etf["date"])
-    etf = etf.set_index("date")["close"].sort_index()
+    etf = load_local_etf()
     last_daily = etf.index.max()
+    chain = load_local_chain()
 
     rows = []
     for ti in range(MIN_TRAIN, len(X)):
@@ -114,27 +190,14 @@ def run():
         draws = fit_predict_conjugate(X.values[:ti], y.values[:ti], X.values[ti:ti + 1])[0]
         model_ann = float(draws.std()) * np.sqrt(12)
 
-        iv_tbl, entry_date = None, None
-        for back in range(0, 7):
-            d = (t - pd.Timedelta(days=back)).date()
-            try:
-                tbl = fetch_iv_table(pd.Timestamp(d))
-            except Exception:
-                tbl = None
-            if tbl is not None:
-                iv_tbl, entry_date = tbl, pd.Timestamp(d)
-                break
-        if iv_tbl is None:
-            rows.append(dict(date=t, traded=0, note="no IV"))
+        entry_date, spot, smile, exp_date = local_iv_smile(chain, t)
+        if entry_date is None:
+            rows.append(dict(date=t, traded=0, note="no local chain snapshot"))
             continue
-
-        spot = float(etf.asof(entry_date))
-        expiry, exp_date = choose_expiry(iv_tbl, entry_date)
-        if expiry is None or pd.Timestamp(exp_date) > last_daily:
+        if pd.Timestamp(exp_date) > last_daily:
             rows.append(dict(date=t, traded=0, note="no realized expiry"))
             continue
         T = max((exp_date - entry_date.date()).days, 1) / 365.0
-        smile = otm_smile(iv_tbl, expiry, spot)
         if len(smile) < 7:
             rows.append(dict(date=t, traded=0, note="thin smile"))
             continue
@@ -181,10 +244,9 @@ def run():
                   f"maxL={pr['max_loss']:.4f} r={r_trade:+.2f} f={f_used:.2f} -> {contrib:+.3f}")
 
         rows.append(dict(date=t, traded=traded, side=side, ratio=ratio, spot=spot,
-                         atm_iv=atm_iv, model_ann=model_ann, expiry=expiry,
+                         atm_iv=atm_iv, model_ann=model_ann, expiry=exp_date,
                          S_exp=S_exp, r_trade=r_trade, contrib=contrib,
                          ao_contrib=ao_contrib, ao_fixed_contrib=ao_fixed_contrib))
-        time.sleep(0.2)
 
     return pd.DataFrame(rows).set_index("date"), y
 
