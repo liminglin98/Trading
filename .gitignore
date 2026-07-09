@@ -21,6 +21,15 @@
 /analysis/*
 !/analysis/macro_model/
 
+# --- options_lab: code only, not local runtime state (positions, logs, caches) ---
+!/analysis/options_lab/
+analysis/options_lab/__pycache__/
+analysis/options_lab/**/*.pyc
+analysis/options_lab/*.log
+analysis/options_lab/positions.csv
+analysis/options_lab/account_config.json
+analysis/options_lab/out/
+
 # --- the one data file the app reads at startup ---
 !/Data/
 /Data/*
