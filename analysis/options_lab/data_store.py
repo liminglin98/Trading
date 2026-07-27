@@ -18,6 +18,15 @@ DATA_DIR = REPO / "Data" / "options"
 POSITIONS_CSV = HERE / "positions.csv"
 
 UNDERLYINGS = {"510050": "50ETF", "510300": "300ETF"}
+
+# Auto-updatable via updater.py (Sina's live quote feed covers these too --
+# verified 2026-07-24) but deliberately kept OUT of UNDERLYINGS: that dict is
+# consumed directly by the Positions tab (margin, real position tracking) and
+# Backtest tab (template engine), which have only been exercised against
+# 50ETF/300ETF. Shown in the Data tab and Technical tab only, until
+# Positions/Backtest get their own validation pass for these products.
+EXT_LIVE_UNDERLYINGS = {"510500": "500ETF", "588000": "科创50ETF", "588080": "科创板50ETF"}
+
 MULTIPLIER = 10000  # contract multiplier for SSE ETF options
 ACCOUNT_CONFIG = HERE / "account_config.json"
 

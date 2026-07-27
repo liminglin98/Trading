@@ -22,8 +22,16 @@ Field notes vs the historical schema:
   * 成交额(万元) = sina amount / 1e4 (sina reports yuan). Verify once with
     --dry-run against the exchange daily stats.
 
+Covers ds.UNDERLYINGS (50ETF/300ETF, also position-tracked in the Positions/
+Backtest tabs) plus ds.EXT_LIVE_UNDERLYINGS (500ETF/科创50ETF/科创板50ETF,
+Data-tab-only for now -- Sina's live quote feed covers these the same way,
+verified 2026-07-24, but Positions/Backtest haven't been validated against
+them). Does NOT cover 创业板ETF(159915)/深证100ETF(159901) -- those aren't in
+Sina's category list at all; see consolidated_store.py for their (vendor-
+snapshot-only) data path.
+
 Usage:
-    python updater.py                 # append 510050 + 510300 + ETF OHLC
+    python updater.py                 # append all of the above + ETF OHLC
     python updater.py --dry-run       # fetch and show, do not write
     python updater.py --underlyings 510050
 """
@@ -43,7 +51,8 @@ import data_store as ds
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 SINA_HDR = {"Referer": "https://stock.finance.sina.com.cn/", "User-Agent": UA}
-CATE = {"510050": "50ETF", "510300": "300ETF"}
+CATE = {"510050": "50ETF", "510300": "300ETF", "510500": "500ETF",
+        "588000": "科创50", "588080": "科创板50"}
 RISK_FREE = 0.02
 BATCH = 40  # codes per hq.sinajs.cn request
 
@@ -377,7 +386,8 @@ def run(underlyings: list[str], dry_run: bool = False) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--underlyings", default="510050,510300")
+    ap.add_argument("--underlyings", default=",".join(ds.UNDERLYINGS) + "," +
+                    ",".join(ds.EXT_LIVE_UNDERLYINGS))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     try:
