@@ -1,22 +1,46 @@
 """Daily EOD updater: appends today's option chain to Data/options CSVs.
 
-Sources (free, run from your own machine — the sina endpoints need a
-mainland-reachable network):
-  * sina hq.sinajs.cn      — option T-quotes (batched) + exchange Greeks/IV
-  * sina openapi           — contract months + expiry day per month
-  * tencent ifzq.gtimg.cn  — ETF daily OHLC (for candlestick charts)
-  * eastmoney push2        — ETF EOD cumulative fund flow (main/large/mid/
-                              small net, yuan) -> Data/options/fund_flow_daily.csv
-  * eastmoney push2ex      — market-wide limit-up/limit-down board counts,
-                              a risk-on/off breadth gauge ->
-                              Data/options/market_sentiment_daily.csv
+Sources (free, run from your own machine — the sina/akshare endpoints need
+a mainland-reachable network):
+  * sina hq.sinajs.cn         — option T-quotes (batched): price/volume/OI/
+                                 strike, everything except Greeks/IV
+  * sina openapi              — contract months + expiry day per month
+  * akshare option_risk_indicator_sse (query.sse.com.cn) — official SSE
+                                 Greeks + IV, one call/run covering all 5
+                                 underlyings. Replaced Sina's own CON_SO_
+                                 Greeks feed 2026-07-28: cross-validated and
+                                 found Sina's own call-side IV/Greeks for
+                                 510500/588000/588080 were simply wrong
+                                 (puts fine) -- see reference_data_sources
+                                 memory / Data/买断日更/README.md for the
+                                 full investigation. Empty if the exchange
+                                 hasn't published today's file yet (normal
+                                 right after close) -- Greeks/IV land as
+                                 blank for that day. append_chain() is
+                                 append-only and never revisits an
+                                 already-recorded date, so a blank day would
+                                 stay blank forever without help -- run()
+                                 below calls backfill_missing_greeks() every
+                                 run (cheap: only re-fetches dates it finds
+                                 still blank) to self-heal once SSE catches
+                                 up, so a plain rerun (button or scheduled
+                                 script) is normally enough; no manual
+                                 backfill script needed for this case anymore
+                                 (2026-08-05, generalized from a one-off
+                                 fix -- see
+                                 project_options_lab_architecture memory).
+  * tencent ifzq.gtimg.cn     — ETF daily OHLC (for candlestick charts)
+  * eastmoney push2           — ETF EOD cumulative fund flow (main/large/mid/
+                                 small net, yuan) -> Data/options/fund_flow_daily.csv
+  * eastmoney push2ex         — market-wide limit-up/limit-down board counts,
+                                 a risk-on/off breadth gauge ->
+                                 Data/options/market_sentiment_daily.csv
     Eastmoney has anti-bot throttling (see _em_get); we only make a handful
     of calls per run so it is a non-issue in practice.
 
 Field notes vs the historical schema:
   * 结算价 is not published by sina -> we store the close price there.
   * 前结算价 = sina prev_close (for options sina reports prev settle here).
-  * Rho is not published -> computed via Black-Scholes from the quoted IV.
   * 上市日 is carried over from the existing CSV; new contracts get the
     first date we see them.
   * 成交额(万元) = sina amount / 1e4 (sina reports yuan). Verify once with
@@ -26,9 +50,11 @@ Covers ds.UNDERLYINGS (50ETF/300ETF, also position-tracked in the Positions/
 Backtest tabs) plus ds.EXT_LIVE_UNDERLYINGS (500ETF/科创50ETF/科创板50ETF,
 Data-tab-only for now -- Sina's live quote feed covers these the same way,
 verified 2026-07-24, but Positions/Backtest haven't been validated against
-them). Does NOT cover 创业板ETF(159915)/深证100ETF(159901) -- those aren't in
-Sina's category list at all; see consolidated_store.py for their (vendor-
-snapshot-only) data path.
+them). Does NOT cover any SZSE underlying (创业板ETF 159915/深证100ETF 159901/
+300ETF(深) 159919/500ETF(深) 159922) -- Sina has zero SZSE option coverage
+(checked repeatedly) and neither does any other free source found so far;
+see Data/买断日更/materialize_szse_full_csv.py for their (vendor-snapshot +
+Black-Scholes-derived, unvalidated) data path instead.
 
 Usage:
     python updater.py                 # append all of the above + ETF OHLC
@@ -38,10 +64,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 
 import pandas as pd
 import requests
@@ -53,7 +79,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 SINA_HDR = {"Referer": "https://stock.finance.sina.com.cn/", "User-Agent": UA}
 CATE = {"510050": "50ETF", "510300": "300ETF", "510500": "500ETF",
         "588000": "科创50", "588080": "科创板50"}
-RISK_FREE = 0.02
 BATCH = 40  # codes per hq.sinajs.cn request
 
 
@@ -130,24 +155,95 @@ def etf_quote(underlying: str) -> tuple[float, date]:
     return _f(v[3]), datetime.strptime(v[30], "%Y-%m-%d").date()
 
 
-def bs_rho(cp: str, s: float, k: float, t_years: float, iv: float,
-           r: float = RISK_FREE) -> float:
-    if not (s > 0 and k > 0 and t_years > 0 and iv and iv > 0):
-        return float("nan")
-    d1 = (math.log(s / k) + (r + iv * iv / 2) * t_years) / (iv * math.sqrt(t_years))
-    d2 = d1 - iv * math.sqrt(t_years)
-    n = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
-    if cp == "C":
-        rho = k * t_years * math.exp(-r * t_years) * n(d2)
-    else:
-        rho = -k * t_years * math.exp(-r * t_years) * n(-d2)
-    return round(rho / 100 * 100, 3)  # per 1.00 rate move, match schema scale
+@lru_cache(maxsize=8)
+def fetch_official_sse_greeks(trade_date_iso: str) -> dict[str, dict]:
+    """{code: {'delta','gamma','theta','vega','rho','iv'}} from akshare's
+    option_risk_indicator_sse -- official SSE data, covers all 5 SSE
+    underlyings in one call (cached per date so fetch_chain_snapshot's
+    per-underlying loop only hits the network once per run). Returns {} if
+    the exchange hasn't published this date yet -- callers should leave
+    Greeks/IV blank rather than guess, same convention as everywhere else
+    in this project."""
+    import akshare as ak
+    ymd = trade_date_iso.replace("-", "")
+    try:
+        df = ak.option_risk_indicator_sse(date=ymd)
+    except Exception as e:
+        print(f"  [WARN] option_risk_indicator_sse({ymd}) failed "
+              f"(not published yet?): {e}")
+        return {}
+    if df.empty:
+        return {}
+    return {
+        str(r.SECURITY_ID): {
+            "delta": r.DELTA_VALUE, "gamma": r.GAMMA_VALUE,
+            "theta": r.THETA_VALUE, "vega": r.VEGA_VALUE,
+            "rho": r.RHO_VALUE, "iv": r.IMPLC_VOLATLTY,
+        }
+        for r in df.itertuples()
+    }
+
+
+GREEKS_COLS = {"delta": ds.C_DELTA, "gamma": ds.C_GAMMA, "theta": ds.C_THETA,
+               "vega": ds.C_VEGA, "rho": ds.C_RHO, "iv": ds.C_IV}
+
+
+def backfill_missing_greeks(underlyings: list[str], lookback_days: int = 10) -> None:
+    """General-purpose fix for the gap fetch_official_sse_greeks() warns
+    about above: append_chain() never revisits an already-recorded date, so
+    a date fetched before SSE published its risk-indicator file stays blank
+    forever unless something goes back for it. Scans each underlying's last
+    `lookback_days` trading dates for blank IV and re-fetches just those
+    dates (fetch_official_sse_greeks is date-keyed and lru_cached, so dates
+    shared across underlyings only hit the network once). Safe to call every
+    run: no-ops instantly once nothing is blank, and dates SSE still hasn't
+    published simply get skipped again next time. Only meaningful for the
+    5 underlyings this feed covers (ds.UNDERLYINGS + ds.EXT_LIVE_UNDERLYINGS);
+    passing others is harmless (just finds no blanks, since only-real-IV
+    underlyings can ever have a blank IV column here)."""
+    for u in underlyings:
+        path = ds.chain_path(u)
+        if not path.exists():
+            continue
+        raw = pd.read_csv(path, encoding="utf-8-sig", dtype={ds.C_CODE: str})
+        dates = sorted(pd.to_datetime(raw[ds.C_DATE]).unique())[-lookback_days:]
+        blank_dates = [d for d in dates
+                      if raw.loc[pd.to_datetime(raw[ds.C_DATE]) == d, ds.C_IV].isna().all()]
+        if not blank_dates:
+            continue
+        changed = False
+        for d in blank_dates:
+            d_iso = pd.Timestamp(d).strftime("%Y-%m-%d")
+            official = fetch_official_sse_greeks(d_iso)
+            if not official:
+                print(f"[{u}] {d_iso}: still not published by SSE, will retry next run")
+                continue
+            mask = pd.to_datetime(raw[ds.C_DATE]) == d
+            n_filled = 0
+            for idx in raw[mask].index:
+                info = official.get(str(raw.at[idx, ds.C_CODE]))
+                if info is None:
+                    continue
+                for key, col in GREEKS_COLS.items():
+                    raw.at[idx, col] = info[key]
+                n_filled += 1
+            print(f"[{u}] {d_iso}: backfilled {n_filled}/{mask.sum()} contracts' Greeks/IV")
+            changed = True
+        if changed:
+            raw.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 # ------------------------------------------------------------------ build
 def fetch_chain_snapshot(underlying: str) -> pd.DataFrame:
     spot, trade_date = etf_quote(underlying)
     print(f"[{underlying}] spot={spot} trade_date={trade_date}")
+
+    official = fetch_official_sse_greeks(trade_date.isoformat())
+    if not official:
+        print(f"  [WARN] no official SSE Greeks/IV for {trade_date} yet -- "
+              f"Delta/Gamma/Theta/Vega/Rho/IV will be blank for this run "
+              f"(rerun later, or backfill with "
+              f"Data/买断日更/replace_greeks_from_sse_official.py)")
 
     listing_dates = _known_listing_dates(underlying)
     rows = []
@@ -157,20 +253,17 @@ def fetch_chain_snapshot(underlying: str) -> pd.DataFrame:
             continue
         exp = expiry_day(underlying, yymm)
         quotes = _hq_batch([f"CON_OP_{c}" for c in codes])
-        greeks = _hq_batch([f"CON_SO_{c}" for c in codes])
         for c in codes:
             q = quotes.get(f"CON_OP_{c}", [])
-            raw = greeks.get(f"CON_SO_{c}", [])
-            if len(q) < 43 or len(raw) < 16:
+            if len(q) < 43:
                 continue
-            g = [raw[0]] + raw[4:]  # raw[1:4] are empty -> realign
             name = q[37]
             cp = "C" if ("购" in name or "C" in name.upper()[:6]) else "P"
             cp = "C" if "购" in name else ("P" if "沽" in name else cp)
             strike, last = _f(q[7]), _f(q[2])
             prev = _f(q[8])
-            iv = _f(g[6])
             dte = (exp - trade_date).days
+            g = official.get(c, {})
             rows.append({
                 ds.C_CODE: c, ds.C_NAME: name, ds.C_MKT: "XSHG", ds.C_CP: cp,
                 ds.C_STRIKE: strike,
@@ -184,10 +277,12 @@ def fetch_chain_snapshot(underlying: str) -> pd.DataFrame:
                 ds.C_PCT: _f(q[6]),
                 ds.C_VOL: _f(q[41]), ds.C_AMT: round(_f(q[42]) / 1e4, 2),
                 ds.C_OI: _f(q[5]),
-                ds.C_DELTA: _f(g[2]), ds.C_THETA: _f(g[4]),
-                ds.C_GAMMA: _f(g[3]), ds.C_VEGA: _f(g[5]),
-                ds.C_RHO: bs_rho(cp, spot, strike, dte / 365.0, iv),
-                ds.C_IV: iv,
+                ds.C_DELTA: g.get("delta", float("nan")),
+                ds.C_THETA: g.get("theta", float("nan")),
+                ds.C_GAMMA: g.get("gamma", float("nan")),
+                ds.C_VEGA: g.get("vega", float("nan")),
+                ds.C_RHO: g.get("rho", float("nan")),
+                ds.C_IV: g.get("iv", float("nan")),
                 ds.C_UND: underlying, ds.C_UND_CLOSE: spot,
             })
     return pd.DataFrame(rows, columns=ds.COLUMNS)
@@ -382,6 +477,12 @@ def run(underlyings: list[str], dry_run: bool = False) -> None:
                 print(f"market sentiment appended "
                       f"({'ok' if n else 'skipped: already recorded'})")
             sentiment_done = True
+
+    if not dry_run:
+        sse_underlyings = [u for u in underlyings
+                          if u in ds.UNDERLYINGS or u in ds.EXT_LIVE_UNDERLYINGS]
+        if sse_underlyings:
+            backfill_missing_greeks(sse_underlyings)
 
 
 if __name__ == "__main__":

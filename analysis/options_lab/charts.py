@@ -1,6 +1,7 @@
 """Plotly figures: candlestick with trade markers, equity, drawdown, P&L."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -138,12 +139,26 @@ def position_pnl_figure(hist: pd.DataFrame, title: str) -> go.Figure:
 
 
 def account_equity_figure(eq: pd.DataFrame) -> go.Figure:
-    """Whole-account asset-tracking curve (positions.account_equity_curve)."""
-    fig = go.Figure(go.Scatter(x=eq["date"], y=eq["equity_yuan"], mode="lines",
-                               fill="tozeroy", line=dict(color="#1f77b4")))
+    """Whole-account asset-tracking curve (positions.account_equity_curve).
+
+    No fill-to-zero here: the account value never gets near zero, and a
+    tozeroy fill forces Plotly's y-axis autorange to include 0 -- which
+    squashes real day-to-day variation (a few thousand yuan against a
+    baseline of hundreds of thousands) into a visually flat line pinned
+    near the top of the chart.
+    """
+    y = eq["equity_yuan"]
+    pad = max((y.max() - y.min()) * 0.1, 1.0)
+    # Category x-axis: one equal-width slot per row, so weekends/holidays
+    # with no data don't stretch the line across a gap -- a true date axis
+    # would otherwise space points by calendar days.
+    x_labels = pd.to_datetime(eq["date"]).dt.strftime("%Y-%m-%d")
+    fig = go.Figure(go.Scatter(x=x_labels, y=y, mode="lines",
+                               line=dict(color="#1f77b4")))
     fig.update_layout(title="Account asset tracking (¥, cash + all positions)",
-                      height=420, xaxis_title="date",
+                      height=420, xaxis_title="date", xaxis_type="category",
                       yaxis_title="account value (¥)",
+                      yaxis_range=[y.min() - pad, y.max() + pad],
                       margin=dict(l=40, r=20, t=50, b=30))
     return fig
 
@@ -157,23 +172,13 @@ def macro_series_figure(s: pd.Series, title: str) -> go.Figure:
     return fig
 
 
-def technical_figure(s: pd.Series, title: str, ma_windows: list[int],
-                     sr_window: int) -> go.Figure:
-    """Price + moving averages + rolling swing support/resistance levels."""
-    import numpy as np
+def swing_levels(s: pd.Series, sr_window: int) -> tuple[list[float], list[float]]:
+    """Most recent distinct swing-high/low levels within a centered window.
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=title,
-                             line=dict(color="#ffc107", width=2.2)))
-
-    ma_colors = ["#1f77b4", "#e65100", "#6a1b9a", "#00897b", "#d33"]
-    for i, w in enumerate(sorted(ma_windows)):
-        ma = s.rolling(w).mean()
-        fig.add_trace(go.Scatter(x=ma.index, y=ma.values, mode="lines",
-                                 name=f"MA{w}",
-                                 line=dict(color=ma_colors[i % len(ma_colors)],
-                                           width=1.2)))
-
+    Returns (resistance_levels, support_levels), each sorted with the
+    level closest to the last price first -- highest of the resistance
+    levels last, lowest of the support levels last.
+    """
     span = sr_window * 2 + 1
     roll_max = s.rolling(span, center=True).max()
     roll_min = s.rolling(span, center=True).min()
@@ -181,14 +186,183 @@ def technical_figure(s: pd.Series, title: str, ma_windows: list[int],
     swing_lows = s[s == roll_min]
     res_levels = sorted(swing_highs.tail(8).unique(), reverse=True)[:4]
     sup_levels = sorted(swing_lows.tail(8).unique())[:4]
+    return res_levels, sup_levels
+
+
+def _smooth_profile(a: np.ndarray, window: int = 3) -> np.ndarray:
+    """Edge-padded moving-average smoothing, same length as input."""
+    if window <= 1 or len(a) < window:
+        return a.copy()
+    pad = window // 2
+    padded = np.pad(a, pad, mode="edge")
+    return np.convolve(padded, np.ones(window) / window, mode="valid")[:len(a)]
+
+
+def _profile_runs(vals: np.ndarray) -> list[tuple[float, int, int]]:
+    """Collapse consecutive near-equal values into (value, start, end)
+    runs (indices into `vals`)."""
+    runs = []
+    i, n = 0, len(vals)
+    while i < n:
+        j = i
+        while j + 1 < n and np.isclose(vals[j + 1], vals[i]):
+            j += 1
+        runs.append((vals[i], i, j))
+        i = j + 1
+    return runs
+
+
+def volume_profile(price: pd.Series, volume: pd.Series, n_bins: int = 24,
+                   value_area_pct: float = 0.70, cluster_frac: float = 0.5) -> dict:
+    """Volume-at-price histogram over the dates common to `price` and `volume`.
+
+    Bins price into `n_bins` equal-width buckets and sums the volume traded
+    on each date into the bucket holding that date's close. Returns the bin
+    midpoints/volumes plus:
+      * poc / va_high / va_low -- point of control (highest-volume bin) and
+        the value area (smallest contiguous run of bins, grown outward from
+        the POC, whose volume share reaches `value_area_pct`).
+      * lvns -- up to 3 low-volume-node price levels: local minima (strictly
+        below both neighboring bins) within the traded range, weakest first.
+        Price tends to move through these quickly rather than linger, so
+        they often act as support/resistance vacuums.
+      * n_clusters / shape -- contiguous runs of bins at or above
+        `cluster_frac` of the profile's own peak volume, within the traded
+        range. One run reads as a balanced, single-peaked (D-shaped)
+        distribution -- consolidation around a fair price. Two or more
+        disjoint runs read as multi-modal -- value has migrated, often seen
+        across trend days/periods. A coarse heuristic (bin-count based), not
+        a rigorous mode test.
+    """
+    idx = price.index.intersection(volume.index)
+    p = price.reindex(idx).astype(float)
+    v = volume.reindex(idx).astype(float).fillna(0.0)
+    empty = dict(bin_mids=[], bin_vols=[], poc=None, va_high=None, va_low=None,
+                lvns=[], n_clusters=0, shape=None)
+    if len(p) == 0 or v.sum() <= 0:
+        return empty
+
+    lo, hi = float(p.min()), float(p.max())
+    if lo == hi:
+        return dict(bin_mids=[lo], bin_vols=[float(v.sum())], poc=lo, va_high=lo,
+                    va_low=lo, lvns=[], n_clusters=1, shape="balanced (single peak)")
+
+    edges = np.linspace(lo, hi, n_bins + 1)
+    bin_idx = np.clip(np.digitize(p.values, edges[1:-1]), 0, n_bins - 1)
+    bin_vols = np.zeros(n_bins)
+    np.add.at(bin_vols, bin_idx, v.values)
+    bin_mids = (edges[:-1] + edges[1:]) / 2
+
+    poc_i = int(np.argmax(bin_vols))
+    target = bin_vols.sum() * value_area_pct
+    lo_i = hi_i = poc_i
+    captured = bin_vols[poc_i]
+    while captured < target and (lo_i > 0 or hi_i < n_bins - 1):
+        left = bin_vols[lo_i - 1] if lo_i > 0 else -1.0
+        right = bin_vols[hi_i + 1] if hi_i < n_bins - 1 else -1.0
+        if left >= right:
+            lo_i -= 1
+            captured += bin_vols[lo_i]
+        else:
+            hi_i += 1
+            captured += bin_vols[hi_i]
+
+    occupied = np.nonzero(bin_vols)[0]
+    occ_lo, occ_hi = int(occupied.min()), int(occupied.max())
+    seg = bin_vols[occ_lo:occ_hi + 1]
+
+    # Light smoothing before shape/LVN detection: with only 10-40 price bins
+    # over a real trading history, per-bin volume is noisy enough that the
+    # raw histogram alone throws up spurious single-bin peaks/troughs.
+    smooth = _smooth_profile(seg, window=5)
+    # Collapse consecutive near-equal smoothed values into runs so a WIDE
+    # flat stretch (e.g. a true zero-volume gap) reads as one trough/peak
+    # candidate instead of failing a strict "<" test against its own tied
+    # neighbor.
+    runs = _profile_runs(smooth)
+
+    lvn_idx = []
+    for k in range(1, len(runs) - 1):
+        v_here, s, e = runs[k]
+        if v_here < runs[k - 1][0] and v_here < runs[k + 1][0]:
+            lvn_idx.append(occ_lo + (s + e) // 2)
+    lvn_idx.sort(key=lambda i: bin_vols[i])
+    lvns = [float(bin_mids[i]) for i in lvn_idx[:3]]
+
+    above = smooth >= smooth.max() * cluster_frac
+    n_clusters = int(np.sum(above & ~np.r_[False, above[:-1]]))
+    shape = ("balanced (single peak)" if n_clusters <= 1
+            else f"multi-modal ({n_clusters} clusters)")
+
+    return dict(bin_mids=bin_mids.tolist(), bin_vols=bin_vols.tolist(),
+               poc=float(bin_mids[poc_i]), va_high=float(bin_mids[hi_i]),
+               va_low=float(bin_mids[lo_i]), lvns=lvns,
+               n_clusters=n_clusters, shape=shape)
+
+
+def technical_figure(s: pd.Series, title: str, ma_windows: list[int],
+                     sr_window: int, volume: pd.Series | None = None,
+                     vp_bins: int = 24) -> go.Figure:
+    """Price + moving averages + rolling swing support/resistance levels.
+
+    If `volume` is given, also overlays a volume profile (volume-at-price
+    histogram) with POC / value-area lines in the right margin.
+    """
+    # Category x-axis: one equal-width slot per trading day, so weekends/
+    # holidays with no bar don't stretch the line across a gap -- a true
+    # date axis would otherwise space points by calendar days.
+    x_labels = pd.to_datetime(s.index).strftime("%Y-%m-%d")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x_labels, y=s.values, mode="lines", name=title,
+                             line=dict(color="#ffc107", width=2.2)))
+
+    ma_colors = ["#1f77b4", "#e65100", "#6a1b9a", "#00897b", "#d33"]
+    for i, w in enumerate(sorted(ma_windows)):
+        ma = s.rolling(w).mean()
+        fig.add_trace(go.Scatter(x=x_labels, y=ma.values, mode="lines",
+                                 name=f"MA{w}",
+                                 line=dict(color=ma_colors[i % len(ma_colors)],
+                                           width=1.2)))
+
+    res_levels, sup_levels = swing_levels(s, sr_window)
     for j, lvl in enumerate(res_levels):
         fig.add_hline(y=lvl, line_dash="dash", line_color="#d33", opacity=0.6,
-                      annotation_text="resistance" if j == 0 else None)
+                      annotation_text=f"R {lvl:,.3f}", annotation_position="right",
+                      annotation_font_color="#d33", annotation_font_size=11)
     for j, lvl in enumerate(sup_levels):
         fig.add_hline(y=lvl, line_dash="dash", line_color="#2a2", opacity=0.6,
-                      annotation_text="support" if j == 0 else None)
+                      annotation_text=f"S {lvl:,.3f}", annotation_position="right",
+                      annotation_font_color="#2a2", annotation_font_size=11)
 
-    fig.update_layout(title=title, height=460,
+    right_margin = 70
+    if volume is not None and len(volume):
+        vp = volume_profile(s, volume, n_bins=vp_bins)
+        if vp["bin_vols"]:
+            fig.update_layout(xaxis=dict(domain=[0.0, 0.82]))
+            fig.add_trace(go.Bar(
+                x=vp["bin_vols"], y=vp["bin_mids"], orientation="h",
+                xaxis="x2", marker_color="rgba(130,130,130,0.35)",
+                name="volume profile", showlegend=False, hoverinfo="skip"))
+            fig.update_layout(xaxis2=dict(
+                domain=[0.83, 1.0], anchor="y", showticklabels=False,
+                showgrid=False, zeroline=False))
+            for y, label in [(vp["poc"], "POC"), (vp["va_high"], "VAH"),
+                             (vp["va_low"], "VAL")]:
+                dash = "solid" if label == "POC" else "dot"
+                fig.add_shape(type="line", xref="paper", x0=0, x1=0.82, yref="y",
+                             y0=y, y1=y, line=dict(color="#8e44ad", width=1.4, dash=dash))
+                fig.add_annotation(xref="paper", x=1.0, y=y, yref="y", xanchor="left",
+                                  text=f"{label} {y:,.3f}", showarrow=False,
+                                  font=dict(color="#8e44ad", size=10))
+            for y in vp["lvns"]:
+                fig.add_shape(type="line", xref="paper", x0=0, x1=0.82, yref="y",
+                             y0=y, y1=y, line=dict(color="#888", width=1.0, dash="dashdot"))
+                fig.add_annotation(xref="paper", x=1.0, y=y, yref="y", xanchor="left",
+                                  text=f"LVN {y:,.3f}", showarrow=False,
+                                  font=dict(color="#888", size=9))
+            right_margin = 90
+
+    fig.update_layout(title=title, height=460, xaxis_type="category",
                       legend=dict(orientation="h", y=1.08),
-                      margin=dict(l=40, r=20, t=60, b=30))
+                      margin=dict(l=40, r=right_margin, t=60, b=30))
     return fig

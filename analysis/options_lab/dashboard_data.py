@@ -106,9 +106,19 @@ def _as_series(df: pd.DataFrame, date_candidates: list[str], val_candidates: lis
 # etf50/etf300/idx_sh are kept (not shown on the Macro Dashboard tab, which
 # skips the "Market" group -- but the Technical tab charts these three
 # directly by key, so they still need to be fetched/stored here).
-def _fetch_etf50():      return _as_series(ak.fund_etf_hist_sina(symbol="sh510050"), ["date"], ["close"])
-def _fetch_etf300():     return _as_series(ak.fund_etf_hist_sina(symbol="sh510300"), ["date"], ["close"])
+# stock_zh_index_daily hits sina's realstock history endpoint, which (despite
+# the name) serves any sh<code> symbol including ETFs, and settles same-day --
+# unlike fund_etf_hist_sina's dedicated fund endpoint, which was observed
+# lagging the ETF's own close by up to a day.
+def _fetch_etf50():      return _as_series(ak.stock_zh_index_daily(symbol="sh510050"), ["date"], ["close"])
+def _fetch_etf300():     return _as_series(ak.stock_zh_index_daily(symbol="sh510300"), ["date"], ["close"])
 def _fetch_idx_sh():     return _as_series(ak.stock_zh_index_daily(symbol="sh000001"), ["date"], ["close"])
+# Volume companions to the three close series above -- kept as their own
+# single-value series (same date index) rather than widening the storage
+# format, so a volume profile can be built by joining close/vol on date.
+def _fetch_etf50_vol():  return _as_series(ak.stock_zh_index_daily(symbol="sh510050"), ["date"], ["volume"])
+def _fetch_etf300_vol(): return _as_series(ak.stock_zh_index_daily(symbol="sh510300"), ["date"], ["volume"])
+def _fetch_idx_sh_vol(): return _as_series(ak.stock_zh_index_daily(symbol="sh000001"), ["date"], ["volume"])
 def _fetch_margin():
     return _as_series(ak.stock_margin_sse(start_date="20100101", end_date=dt.date.today().strftime("%Y%m%d")),
                        ["信用交易日期", "日期", "date"],
@@ -142,6 +152,9 @@ SERIES: dict[str, tuple] = {
     "etf50":      ("50ETF close", "Market", "¥", "daily", _fetch_etf50),
     "etf300":     ("300ETF close", "Market", "¥", "daily", _fetch_etf300),
     "idx_sh":     ("Shanghai Composite", "Market", "", "daily", _fetch_idx_sh),
+    "etf50_vol":  ("50ETF volume", "Market", "shares", "daily", _fetch_etf50_vol),
+    "etf300_vol": ("300ETF volume", "Market", "shares", "daily", _fetch_etf300_vol),
+    "idx_sh_vol": ("Shanghai Composite volume", "Market", "shares", "daily", _fetch_idx_sh_vol),
     "margin_bal": ("SSE margin financing balance", "Liquidity", "¥", "daily", _fetch_margin),
     "shibor_1w":  ("1W SHIBOR", "Liquidity", "%", "daily", _fetch_shibor),
     "cn10y":      ("China 10Y govt yield", "Rates", "%", "daily", _fetch_cn10y),

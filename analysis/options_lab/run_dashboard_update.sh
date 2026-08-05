@@ -9,4 +9,5 @@ LOG="$HERE/dashboard_update.log"
 echo "----------------------------------------" >> "$LOG"
 echo "Run started: $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$LOG"
 "$PYTHON" dashboard_data.py >> "$LOG" 2>&1
+"$PYTHON" updater.py >> "$LOG" 2>&1
 echo "Run finished: $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$LOG"

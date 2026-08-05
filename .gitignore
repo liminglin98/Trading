@@ -28,7 +28,10 @@ analysis/options_lab/**/*.pyc
 analysis/options_lab/*.log
 analysis/options_lab/positions.csv
 analysis/options_lab/account_config.json
+analysis/options_lab/wecom_config.json
+analysis/options_lab/pushplus_config.json
 analysis/options_lab/out/
+analysis/options_lab/archive/out/
 
 # --- the one data file the app reads at startup ---
 !/Data/

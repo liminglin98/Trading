@@ -27,6 +27,20 @@ UNDERLYINGS = {"510050": "50ETF", "510300": "300ETF"}
 # Positions/Backtest get their own validation pass for these products.
 EXT_LIVE_UNDERLYINGS = {"510500": "500ETF", "588000": "科创50ETF", "588080": "科创板50ETF"}
 
+# Vendor-snapshot-backed, not Sina-live (Sina's category list has no SZSE
+# options at all -- verified 2026-07-24/28), but same full Data/options CSV
+# format as the two groups above. Materialized 2026-07-28 by
+# Data/买断日更/materialize_szse_full_csv.py from the consolidated 买断日更
+# parquet: IV and most Greeks (all of vendor B's June-2026-onward period,
+# plus IV throughout since neither vendor ever carries it) are Black-Scholes
+# derived, NOT independently validated against an authoritative source --
+# unlike the SSE underlyings above, no official SZSE per-contract
+# risk-indicator feed exists (checked; see reference_data_sources memory).
+# Data/Technical tab only, same as EXT_LIVE_UNDERLYINGS -- Positions/Backtest
+# haven't been exercised against these either.
+EXT_SZSE_UNDERLYINGS = {"159901": "深证100ETF", "159915": "创业板ETF",
+                       "159919": "300ETF(深)", "159922": "500ETF(深)"}
+
 MULTIPLIER = 10000  # contract multiplier for SSE ETF options
 ACCOUNT_CONFIG = HERE / "account_config.json"
 

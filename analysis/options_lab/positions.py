@@ -184,10 +184,14 @@ def position_summary(chains: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if df.empty:
         return df
     out = []
+    marks_by_underlying: dict[str, tuple] = {}  # avoid re-filtering the same
+    # underlying's full chain history once per position that shares it
     for pid, g in df.groupby("position_id"):
         u = g["underlying"].iloc[0]
-        chain = chains.get(u)
-        marks, asof = (None, None) if chain is None else latest_marks(chain)
+        if u not in marks_by_underlying:
+            chain = chains.get(u)
+            marks_by_underlying[u] = (None, None) if chain is None else latest_marks(chain)
+        marks, asof = marks_by_underlying[u]
         cost = mark = 0.0
         n_open = int((g["status"] != "closed").sum())
         for _, leg in g.iterrows():
@@ -269,18 +273,27 @@ def pnl_history(pid: str, chains: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def account_equity_curve(chains: dict[str, pd.DataFrame],
-                         baseline_value: float) -> pd.DataFrame:
+                         baseline_value: float,
+                         baseline_asof: str | None = None) -> pd.DataFrame:
     """Whole-account asset-tracking curve across EVERY tracked position (open
-    and closed combined), anchored to `baseline_value` -- the current known
-    true account value (cash + all positions marked to market).
+    and closed combined), anchored to `baseline_value` -- the last known
+    TRUE account value (cash + all positions marked to market), verified as
+    of `baseline_asof`.
 
     Each position's own pnl_history is reindexed onto the shared date axis:
     0 before that position's own start, forward-filled (flat) after its own
     last available date (this naturally covers closed positions, whose
     pnl_history stops at close but whose realized P&L must keep counting
     forward). Summing across positions gives a combined P&L path; equity(t)
-    = baseline_value + (total_pnl(t) - total_pnl(today)) backs out an implied
-    historical account value.
+    = baseline_value + (total_pnl(t) - total_pnl(baseline_asof)) backs out
+    an implied account value at every date, including dates AFTER
+    baseline_asof -- so as the daily updater appends fresh chain data, the
+    latest point on this curve rolls forward automatically instead of
+    staying pinned to whatever was last typed into the anchor box.
+
+    If baseline_asof is missing or falls outside the tracked P&L window, the
+    anchor falls back to the latest available date (old behavior: equity at
+    the most recent point equals baseline_value exactly).
 
     This assumes the ONLY thing moving the account within the window is
     these tracked option positions -- no deposits/withdrawals/other trades.
@@ -301,12 +314,23 @@ def account_equity_curve(chains: dict[str, pd.DataFrame],
 
     full_index = pd.DatetimeIndex(
         sorted(set().union(*[s.index for s in series.values()])))
+    # One extra day before the earliest position's start, so the curve shows
+    # the account's value just before any tracked position existed (all
+    # per-position series reindex to NaN->0 there, since it precedes their
+    # own start too).
+    pre_start = full_index.min() - pd.Timedelta(days=1)
+    full_index = pd.DatetimeIndex(sorted(set(full_index) | {pre_start}))
     total = pd.Series(0.0, index=full_index)
     for s in series.values():
         total = total.add(s.reindex(full_index).ffill().fillna(0.0))
 
-    today_total = float(total.iloc[-1])
-    equity = baseline_value + (total - today_total)
+    anchor_dt = pd.Timestamp(baseline_asof) if baseline_asof else None
+    if anchor_dt is not None and full_index.min() <= anchor_dt:
+        anchor_idx = full_index[full_index <= anchor_dt][-1]
+        anchor_total = float(total.loc[anchor_idx])
+    else:
+        anchor_total = float(total.iloc[-1])
+    equity = baseline_value + (total - anchor_total)
     return pd.DataFrame({"date": full_index, "total_pnl_yuan": total.values,
                         "equity_yuan": equity.values})
 
