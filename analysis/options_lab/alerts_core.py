@@ -498,18 +498,25 @@ ALERT_LABELS_ZH = {
 
 
 def _run_from_bool_series(bool_series: pd.Series) -> dict | None:
-    """Trailing run of True values ending at the series' last index -- same
-    counting pattern ma150_state uses inline, generalized here for reuse."""
+    """Most recent contiguous run of True values in bool_series: the
+    still-ongoing run if the series is currently True, or the most recently
+    completed run otherwise. A signal that triggered a position and has
+    since reverted below threshold still has a real, trackable position --
+    it's the position's own exit rule that closes it, not the raw signal --
+    so callers must check the run's end_date against today themselves
+    (position_detail does, via each branch's own end_date/last_date check).
+    None if the series has never been True."""
     s = bool_series.dropna()
-    if s.empty or not bool(s.iloc[-1]):
+    vals = list(s.values)
+    end_pos = next((i for i in range(len(vals) - 1, -1, -1) if bool(vals[i])), None)
+    if end_pos is None:
         return None
-    run = 0
-    for v in s.iloc[::-1]:
-        if bool(v):
-            run += 1
-        else:
-            break
-    return {"entry_date": s.index[-run], "run_days": run}
+    pos = end_pos
+    while pos >= 0 and bool(vals[pos]):
+        pos -= 1
+    entry_pos = pos + 1
+    return {"entry_date": s.index[entry_pos], "end_date": s.index[end_pos],
+            "run_days": end_pos - entry_pos + 1}
 
 
 def _capped_entry(bool_series: pd.Series, max_hold: int | None) -> dict | None:
@@ -519,14 +526,17 @@ def _capped_entry(bool_series: pd.Series, max_hold: int | None) -> dict | None:
     exit discipline, a hypothetical position opened on day 1 of that run
     would already have been closed by day max_hold. Rather than reporting a
     stale P&L against a trade that would already be over, this re-anchors
-    entry_date at max_hold trading days ago and flags max_hold_reached."""
+    entry_date at max_hold trading days before the run's END and flags
+    max_hold_reached."""
     run = _run_from_bool_series(bool_series)
     if run is None:
         return None
     if max_hold is not None and run["run_days"] > max_hold:
         s = bool_series.dropna()
-        return {"entry_date": s.index[-max_hold], "run_days": max_hold, "max_hold_reached": True}
-    return {**run, "max_hold_reached": False}
+        end_pos = s.index.get_loc(run["end_date"])
+        return {"entry_date": s.index[end_pos - max_hold + 1], "run_days": max_hold,
+                "max_hold_reached": True}
+    return {"entry_date": run["entry_date"], "run_days": run["run_days"], "max_hold_reached": False}
 
 
 def vol_signal_series(u: str, module: str, signal: str) -> pd.Series:
@@ -670,22 +680,30 @@ def _finalize_short_atm_straddle(cfg: dict, bool_s: pd.Series, chain_loader) -> 
     if prices is None:
         return None
     end_date = min(constr["expiry"], run["entry_date"] + pd.tseries.offsets.BDay(cfg["max_hold"]))
+    if chain[ds.C_DATE].max() >= end_date:
+        return None  # already past its own exit rule -- closed, nothing to track
     pos = _finalize_position("short", -constr["credit"], -sum(prices), run["entry_date"],
                               run["max_hold_reached"], end_date, stop_loss_mult=STOP_LOSS_MULT)
     return [{"name": f"{cfg['name']} ({cfg['u']})", **pos, "construction": constr}]
 
 
 def position_detail(row: dict, chain_loader=None, idx_sh_series: pd.Series | None = None) -> list[dict] | None:
-    """For an ACTIVE alert row (from evaluate_summary), reconstruct the
-    hypothetical position as if entered the day the signal first turned
-    active: entry construction (via the matching suggest_* fn, evaluated on
-    the chain as of that date), reprice the SAME legs at today's chain, and
-    report P&L against the strategy's own real exit rule (see the exit-rule
-    table in the project plan / docstrings on the individual backtest
-    modules -- not invented here). Returns a list since the MA150 signal
-    suggests two independent positions (50ETF + 300ETF); everything else
-    returns a single-element list, or None if a position can't be built
-    (e.g. chain unavailable, no listed contract at entry)."""
+    """Reconstruct the hypothetical position from the alert row's most
+    recent trigger (from evaluate_summary): entry construction (via the
+    matching suggest_* fn, evaluated on the chain as of that date), reprice
+    the SAME legs at today's chain, and report P&L against the strategy's
+    own real exit rule (see the exit-rule table in the project plan /
+    docstrings on the individual backtest modules -- not invented here).
+    Works whether the row is currently active (today is inside the trigger
+    run) or not -- a signal that triggered a position and has since
+    reverted below threshold still has a real open position until its own
+    exit rule (stop-loss/profit-target/max-hold/expiry), not the raw
+    signal, closes it; each branch below checks the reconstructed end_date
+    against today and returns None once that's passed. Returns a list since
+    the MA150 signal suggests two independent positions (50ETF + 300ETF);
+    everything else returns a single-element list, or None if there's no
+    open position to report (never triggered, already closed, or couldn't
+    be built -- e.g. chain unavailable, no listed contract at entry)."""
     loader = chain_loader or ds.load_chain
     side, idx, cfg = row["side"], row["strategy_idx"], row.get("cfg")
 
@@ -708,6 +726,8 @@ def position_detail(row: dict, chain_loader=None, idx_sh_series: pd.Series | Non
             prices = reprice_legs(chain, legs)
             if prices is None:
                 continue
+            if chain[ds.C_DATE].max() >= constr["expiry"]:
+                continue  # already past expiry -- closed, nothing to track
             mark = prices[0] - prices[1]
             # leaderboard's own stop-gain is +100% of debit (stop_gain_price
             # = net_debit * 2 in suggest_put_debit_spread) -> profit_target_mult=1.0
@@ -731,6 +751,8 @@ def position_detail(row: dict, chain_loader=None, idx_sh_series: pd.Series | Non
         if prices is None:
             return None
         end_date = min(constr["expiry"], run["entry_date"] + pd.tseries.offsets.BDay(cfg["max_hold"]))
+        if chain[ds.C_DATE].max() >= end_date:
+            return None  # already past its own exit rule -- closed, nothing to track
         pos = _finalize_position("long", constr["debit"], sum(prices), run["entry_date"],
                                   run["max_hold_reached"], end_date, profit_target_mult=cfg["profit_target"])
         return [{"name": f"{cfg['name']} ({cfg['u']})", **pos, "construction": constr}]
@@ -755,6 +777,8 @@ def position_detail(row: dict, chain_loader=None, idx_sh_series: pd.Series | Non
         if prices is None:
             return None
         end_date = min(constr["expiry"], run["entry_date"] + pd.tseries.offsets.BDay(cfg["max_hold"]))
+        if chain[ds.C_DATE].max() >= end_date:
+            return None  # already past its own exit rule -- closed, nothing to track
         pos = _finalize_position("short", -constr["credit"], -sum(prices), run["entry_date"],
                                   run["max_hold_reached"], end_date, stop_loss_mult=STOP_LOSS_MULT)
         return [{"name": f"{cfg['name']} ({cfg['u']})", **pos, "construction": constr}]

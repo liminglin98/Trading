@@ -18,8 +18,10 @@ from pathlib import Path
 
 import requests
 
+import data_store as ds
 import overseas_digest
 import push_alerts
+import updater
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "pushplus_config.json"
@@ -36,6 +38,13 @@ def _log(msg: str) -> None:
 
 def build_message() -> str:
     today = datetime.now().date().isoformat()
+    # Yesterday's SSE Greeks/IV file is often not published yet when the
+    # 18:00 update_data.bat run pulls the chain, leaving that date's IV
+    # column blank; alerts_core then anchors "today" one trading day further
+    # back than the data actually available by push time (~8:30am, well
+    # after SSE catches up). Retry the backfill here so the push reflects
+    # the latest date, not a stale active/near-trigger read.
+    updater.backfill_missing_greeks(list(ds.UNDERLYINGS) + list(ds.EXT_LIVE_UNDERLYINGS))
     alerts_section = push_alerts.build_alerts_section()
     overseas_section = overseas_digest.build_overseas_section()
     return f"## Options Lab 每日推送 {today}\n\n{alerts_section}\n\n{overseas_section}"

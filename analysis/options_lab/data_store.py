@@ -144,17 +144,34 @@ def last_chain_date(underlying: str) -> pd.Timestamp | None:
 
 
 def append_chain(underlying: str, rows: pd.DataFrame) -> int:
-    """Append new rows (already in schema order); refuses duplicate dates."""
+    """Append new rows (already in schema order, all sharing one trade date
+    -- see updater.fetch_chain_snapshot). If that date is already on file,
+    REPLACES the existing rows for it rather than silently skipping them:
+    app.py's "Update now" button can be clicked mid-trading-day, writing an
+    intraday snapshot for "today"; a later same-day re-fetch (e.g. the
+    scheduled EOD job) needs to be able to correct it, not have its real
+    closing data discarded. This is what happened to 2026-08-05's data
+    across all 5 underlyings before this fix -- see backfill_aug5.py repair
+    / project_options_lab_architecture memory. Refuses dates older than
+    what's on file (out-of-order write), same as before."""
     rows = rows[COLUMNS]
-    existing = last_chain_date(underlying)
-    new_dates = pd.to_datetime(rows[C_DATE])
-    if existing is not None:
-        rows = rows[new_dates > existing]
-    if rows.empty:
-        return 0
     path = chain_path(underlying)
-    rows.to_csv(path, mode="a", header=not path.exists(), index=False,
-                encoding="utf-8-sig")
+    if not path.exists():
+        rows.to_csv(path, index=False, encoding="utf-8-sig")
+        return len(rows)
+    new_dates = pd.to_datetime(rows[C_DATE]).unique()
+    if len(new_dates) != 1:
+        raise ValueError(f"append_chain expects rows for a single date, got {len(new_dates)}")
+    new_date = pd.Timestamp(new_dates[0])
+    existing_last = last_chain_date(underlying)
+    if existing_last is not None and new_date < existing_last:
+        return 0
+    if existing_last is not None and new_date == existing_last:
+        existing = pd.read_csv(path, encoding="utf-8-sig", dtype={C_CODE: str, C_UND: str})
+        kept = existing[pd.to_datetime(existing[C_DATE]) != new_date]
+        pd.concat([kept, rows], ignore_index=True).to_csv(path, index=False, encoding="utf-8-sig")
+        return len(rows)
+    rows.to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
     return len(rows)
 
 

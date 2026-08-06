@@ -9,6 +9,8 @@ Tabs:
 """
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 import streamlit as st
 
@@ -85,6 +87,15 @@ with tab_data:
             st.metric(f"{name} ({u})",
                       last.date().isoformat() if last is not None else "missing")
         st.divider()
+        _now = dt.datetime.now()
+        if (_now.hour, _now.minute) < (15, 30):
+            st.warning("Before ~15:30 China time: a fetch now only captures an "
+                       "intraday snapshot, not the final close (this is what "
+                       "happened to 2026-08-05's data). Safe to click either "
+                       "way -- a later same-day re-fetch (e.g. tonight's "
+                       "scheduled job) now correctly replaces it -- but "
+                       "anything reading today's chain before then will see "
+                       "partial-day prices.")
         if st.button("Update now (fetch today's chain)", type="primary"):
             with st.spinner("Fetching from sina/tencent..."):
                 try:

@@ -1,8 +1,10 @@
 """Builds the Chinese-language options_lab alert section of the daily WeChat
-push. Only includes alerts that are currently active or close to triggering
-(see alerts_core.near_trigger_detail's NEAR_BAND_* constants) -- not all ~15
-tracked rows every day. daily_push.py owns actually sending the message;
-this module only builds text, so it's independently testable:
+push. Only includes alerts with an open position (whether triggered today
+or still held from an earlier trigger -- see alerts_core.position_detail)
+or close to triggering (see alerts_core.near_trigger_detail's NEAR_BAND_*
+constants) -- not all ~15 tracked rows every day. daily_push.py owns
+actually sending the message; this module only builds text, so it's
+independently testable:
 
     python push_alerts.py
 """
@@ -10,6 +12,23 @@ from __future__ import annotations
 
 import alerts_core as ac
 import dashboard_data as DD
+import data_store as ds
+
+
+def _cached_chain_loader():
+    """Memoizing wrapper around ds.load_chain: position_detail() now runs
+    for every alert row (not just active ones -- see build_alerts_section),
+    and several rows share the same underlying (510050/510300 each back
+    5-6 different alert configs), so without this each push run re-reads
+    and re-parses the same 50-80MB+ chain CSV from disk that many times."""
+    cache: dict = {}
+
+    def loader(u: str):
+        if u not in cache:
+            cache[u] = ds.load_chain(u)
+        return cache[u]
+
+    return loader
 
 
 def _fmt_pct(x: float) -> str:
@@ -22,7 +41,13 @@ def _fmt_yuan(x: float) -> str:
 
 def _active_block(row: dict, pos: dict) -> str:
     label = ac.ALERT_LABELS_ZH.get((row["side"], row["strategy_idx"]), row["strategy"])
-    lines = [f"🔔 {label} · {pos['name']}",
+    # row["active"] is today's raw signal state, not the position's own
+    # exit rule: a position can still be open (persisted below in the
+    # "already triggered" section) after the signal that opened it has
+    # reverted below threshold. Note that explicitly so the push doesn't
+    # read as if it's still firing today.
+    holding_note = "" if row["active"] else "（信号已回落，持仓中）"
+    lines = [f"🔔 {label} · {pos['name']}{holding_note}",
              f"开仓日期：{pos['entry_date'].date()}",
              f"净盈亏：{_fmt_pct(pos['pnl_pct'])}（{_fmt_yuan(pos['pnl_yuan'])}）"]
     if "stop_loss_pct" in pos:
@@ -59,16 +84,22 @@ def _near_block(row: dict, near: dict) -> str:
 def build_alerts_section(chain_loader=None) -> str:
     """Chinese markdown section for the options_lab alerts, ready to concat
     into the daily push message."""
+    if chain_loader is None:
+        chain_loader = _cached_chain_loader()
     idx = DD.load_series("idx_sh")
     rows = ac.evaluate_summary(idx, chain_loader=chain_loader)
 
     active_blocks, near_blocks = [], []
     for row in rows:
-        if row["active"]:
-            positions = ac.position_detail(row, chain_loader=chain_loader, idx_sh_series=idx)
-            for pos in (positions or []):
+        # Try position_detail first regardless of today's raw signal state:
+        # a position stays open (and worth tracking) until its own exit
+        # rule fires, which can be well after the entry signal reverts.
+        # Only fall back to near-trigger when there's truly nothing open.
+        positions = ac.position_detail(row, chain_loader=chain_loader, idx_sh_series=idx)
+        if positions:
+            for pos in positions:
                 active_blocks.append(_active_block(row, pos))
-        else:
+        elif not row["active"]:
             near = ac.near_trigger_detail(row)
             if near:
                 near_blocks.append(_near_block(row, near))
