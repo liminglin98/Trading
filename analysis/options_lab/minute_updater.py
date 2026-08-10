@@ -132,6 +132,29 @@ def _third_friday(year: int, month: int) -> date:
     return d + timedelta(days=14)
 
 
+def _with_retries(fn, *args, attempts: int = 3, delay: float = 2.0, **kwargs):
+    """Retry a flaky call up to `attempts` times -- covers transient network
+    errors like the SSL EOF hiccup observed live during testing (hq.sinajs.cn
+    occasionally drops a connection mid-handshake). Only used for the
+    ONE-TIME startup discovery calls (contract_months/option_codes/
+    expiry_day/*_list_sina), which happen once a day before the polling loop
+    starts -- a single bad moment there would otherwise crash the whole run
+    before it collects a single row. The recurring per-minute fetches don't
+    need this: they already have their own per-underlying catch-and-skip
+    (_safe_snap_etf/_safe_snap_index), and the next cycle ~60s later is
+    itself a natural retry."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts:
+                print(f"[WARN] {fn.__name__} failed (attempt {attempt}/{attempts}): {e} -- retrying in {delay}s")
+                time.sleep(delay)
+    raise last_exc
+
+
 def _cp_from_name(name: str) -> str:
     """Same call/put determination updater.py uses (name-text based, not
     which OP_UP_/OP_DOWN_ list the code came from -- option_codes() merges
@@ -153,9 +176,9 @@ def resolve_etf_universe(underlyings: list[str]) -> dict[str, dict]:
     universe = {}
     for u in underlyings:
         expiry_by_month, codes = {}, []
-        for yymm in U.contract_months(u):
-            expiry_by_month[yymm] = U.expiry_day(u, yymm)
-            codes += [(c, yymm) for c in U.option_codes(u, yymm)]
+        for yymm in _with_retries(U.contract_months, u):
+            expiry_by_month[yymm] = _with_retries(U.expiry_day, u, yymm)
+            codes += [(c, yymm) for c in _with_retries(U.option_codes, u, yymm)]
         universe[u] = {"codes": codes, "expiry_by_month": expiry_by_month}
         print(f"[{u}] {len(codes)} contracts across {len(expiry_by_month)} expiry months")
     return universe
@@ -191,7 +214,7 @@ def resolve_index_universe(underlyings: list[str]) -> dict[str, list[str]]:
     universe = {}
     for u in underlyings:
         fn = getattr(ak, INDEX_LIST_FN[u])
-        d = fn()
+        d = _with_retries(fn)
         months = [m for v in d.values() for m in v]
         universe[u] = months
         print(f"[{u}] {len(months)} contract months resolved")
