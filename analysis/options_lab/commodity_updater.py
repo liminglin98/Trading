@@ -22,6 +22,19 @@ codes seen under Data/options/option_daily_*.csv). The remainder (AD, BC,
 BU, BZ, FU, JM, NR, OP, PD, PT, SP) have no known akshare mapping -- run()
 skips them with a warning rather than guess.
 
+DCE fallback: dce.com.cn itself returns HTTP 412 (a JS-challenge WAF) from
+this network -- confirmed not specific to option_hist_dce, the bare
+homepage 412s too. 9 of DCE's 17 varieties (M/C/I/PG/A/B/Y/EG/EB) are
+separately reachable via Sina's commodity-option pages
+(stock.finance.sina.com.cn/futures/view/optionsDP.php), a different host
+entirely, so they get a Sina-backed fallback (DCE_SINA_VARIETIES /
+dce_sina_* below) instead of being left unmapped like the other 8 DCE
+varieties (L/V/PP/P/JD/CS/LH/LG, confirmed absent from Sina's page too --
+no known free source for those). Sina's contract_table_sina gives a live
+quote snapshot (no OHLC/settle/turnover, just last price + OI), used as
+the daily EOD source; option_commodity_hist_sina gives real per-contract
+daily history, used for backfill.
+
 Field notes vs UNIFIED_COLS:
   * underlying_symbol/name/expire_date/list_date/delist_date aren't
     reported by these endpoints -- left blank, same as vendor_b rows in
@@ -92,6 +105,11 @@ CZCE_MAP = {
 GFEX_MAP = {"SI": "工业硅", "LC": "碳酸锂", "PS": "多晶硅"}
 
 ALL_VARIETIES = {**SHFE_MAP, **DCE_MAP, **CZCE_MAP, **GFEX_MAP}
+
+# Subset of DCE_MAP reachable via Sina instead of dce.com.cn directly (see
+# module docstring). Chinese names match DCE_MAP's exactly, so no separate
+# mapping dict is needed -- just a smaller key set.
+DCE_SINA_VARIETIES = {"M", "C", "I", "PG", "A", "B", "Y", "EG", "EB"}
 
 CP_STRIKE_RE = re.compile(r"(C|P)(\d+(?:\.\d+)?)$")
 
@@ -192,6 +210,107 @@ def fetch_gfex(variety: str, trade_date: str) -> pd.DataFrame:
                   "akshare_gfex")
 
 
+def dce_sina_contract_months(variety: str) -> list[str]:
+    import akshare as ak
+    df = ak.option_commodity_contract_sina(symbol=DCE_MAP[variety])
+    return df["合约"].tolist() if not df.empty else []
+
+
+def dce_sina_contract_table(variety: str, month: str) -> pd.DataFrame:
+    import akshare as ak
+    return ak.option_commodity_contract_table_sina(symbol=DCE_MAP[variety], contract=month)
+
+
+def fetch_dce_sina_day(variety: str, date_str: str) -> pd.DataFrame:
+    """EOD snapshot for a Sina-covered DCE variety: one live quote call per
+    contract-month (no trade_date parameter on this endpoint -- meant to be
+    called once after close, treating 最新价 as that day's close/settle,
+    same convention as cffex_updater.py's spot-snapshot path)."""
+    rows = []
+    for month in dce_sina_contract_months(variety):
+        table = dce_sina_contract_table(variety, month)
+        time.sleep(0.3)
+        if table.empty:
+            continue
+        for _, r in table.iterrows():
+            for price_col, oi_col, code_col in (
+                ("看涨合约-最新价", "看涨合约-持仓量", "看涨合约-看涨期权合约"),
+                ("看跌合约-最新价", "看跌合约-持仓量", "看跌合约-看跌期权合约"),
+            ):
+                code = r.get(code_col)
+                if not isinstance(code, str) or not code:
+                    continue
+                cp, strike = _cp_strike(code.upper())
+                rows.append({
+                    "date": date_str, "code": code.upper(),
+                    "underlying_symbol": pd.NA, "name": pd.NA,
+                    "contract_type": cp,
+                    "strike": strike if strike is not None else r.get("行权价"),
+                    "expire_date": pd.NA, "list_date": pd.NA, "delist_date": pd.NA,
+                    "prev_settle": pd.NA, "prev_close": pd.NA,
+                    "open": pd.NA, "high": pd.NA, "low": pd.NA,
+                    "close": r.get(price_col), "settle": r.get(price_col),
+                    "volume": pd.NA, "turnover": pd.NA,
+                    "open_interest": r.get(oi_col),
+                    "delta": pd.NA, "theta": pd.NA, "gamma": pd.NA,
+                    "vega": pd.NA, "rho": pd.NA, "source": "akshare_dce_sina_spot",
+                })
+    if not rows:
+        return _empty()
+    return pd.DataFrame(rows)[UNIFIED_COLS]
+
+
+def fetch_dce_sina_backfill(variety: str, start: str, end: str) -> pd.DataFrame:
+    """Real per-contract daily OHLCV history (option_commodity_hist_sina),
+    filtered to [start, end] -- one call per contract discovered off the
+    variety's currently-listed contract-months, same limitation as
+    cffex_updater.py's backfill (can't reach contracts that already expired
+    off the roster)."""
+    import akshare as ak
+    d0 = datetime.strptime(start, "%Y%m%d").date()
+    d1 = datetime.strptime(end, "%Y%m%d").date()
+    codes: set[str] = set()
+    for month in dce_sina_contract_months(variety):
+        table = dce_sina_contract_table(variety, month)
+        time.sleep(0.3)
+        if table.empty:
+            continue
+        codes.update(c for c in table["看涨合约-看涨期权合约"].dropna().tolist() if c)
+        codes.update(c for c in table["看跌合约-看跌期权合约"].dropna().tolist() if c)
+
+    frames = []
+    for code in sorted(codes):
+        cp, strike = _cp_strike(code.upper())
+        try:
+            hist = ak.option_commodity_hist_sina(symbol=code)
+        except Exception as e:
+            print(f"  [{variety}] {code}: hist_sina failed: {e}")
+            continue
+        time.sleep(0.2)
+        if hist.empty:
+            continue
+        hist["date"] = pd.to_datetime(hist["date"])
+        hist = hist[(hist["date"] >= pd.Timestamp(d0)) & (hist["date"] <= pd.Timestamp(d1))]
+        if hist.empty:
+            continue
+        frames.append(pd.DataFrame({
+            "date": hist["date"].dt.strftime("%Y-%m-%d"),
+            "code": code.upper(), "underlying_symbol": pd.NA, "name": pd.NA,
+            "contract_type": cp, "strike": strike,
+            "expire_date": pd.NA, "list_date": pd.NA, "delist_date": pd.NA,
+            "prev_settle": pd.NA, "prev_close": pd.NA,
+            "open": hist["open"].values, "high": hist["high"].values,
+            "low": hist["low"].values, "close": hist["close"].values,
+            "settle": hist["close"].values, "volume": hist["volume"].values,
+            "turnover": pd.NA, "open_interest": pd.NA,
+            "delta": pd.NA, "theta": pd.NA, "gamma": pd.NA, "vega": pd.NA,
+            "rho": pd.NA, "source": "akshare_dce_sina_hist",
+        }))
+    if not frames:
+        return _empty()
+    return pd.concat(frames, ignore_index=True)[UNIFIED_COLS]
+
+
 _FETCHERS = ({v: fetch_shfe for v in SHFE_MAP}
             | {v: fetch_dce for v in DCE_MAP}
             | {v: fetch_czce for v in CZCE_MAP}
@@ -210,16 +329,17 @@ def out_path(variety: str) -> str:
 
 
 def append_day(variety: str, rows: pd.DataFrame) -> int:
-    """Merge one day's rows into the variety's CSV, replacing any existing
-    rows for that date (same semantics as data_store.append_chain -- a
-    same-day rerun corrects rather than duplicates)."""
+    """Merge rows into the variety's CSV, replacing any existing rows for
+    every date present in `rows` (same semantics as data_store.append_chain
+    -- a rerun corrects rather than duplicates). Rows may span a single date
+    (the normal daily-EOD case) or many (the Sina backfill path)."""
     if rows.empty:
         return 0
     path = out_path(variety)
-    date_str = rows["date"].iloc[0]
+    dates = set(rows["date"])
     if os.path.exists(path):
         existing = pd.read_csv(path, dtype={"code": str})
-        existing = existing[existing["date"] != date_str]
+        existing = existing[~existing["date"].isin(dates)]
         combined = pd.concat([existing, rows], ignore_index=True)[UNIFIED_COLS]
     else:
         combined = rows
@@ -232,7 +352,14 @@ def append_day(variety: str, rows: pd.DataFrame) -> int:
 
 
 def run_day(varieties: list[str], trade_date: str, dry_run: bool = False,
-           delay: float = 0.3) -> None:
+           delay: float = 0.3, use_sina_fallback: bool = True) -> None:
+    """use_sina_fallback must stay False for any trade_date that isn't
+    "today" -- fetch_dce_sina_day has no trade_date parameter (it's a live
+    quote snapshot), so calling it for a past date would silently mislabel
+    today's prices as that past date's. run_backfill below handles DCE's
+    Sina-covered varieties through fetch_dce_sina_backfill instead, which
+    is date-aware."""
+    date_str = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
     for v in varieties:
         if v not in _FETCHERS:
             print(f"[{v}] no akshare mapping known -- skipped")
@@ -240,8 +367,15 @@ def run_day(varieties: list[str], trade_date: str, dry_run: bool = False,
         try:
             rows = fetch_variety(v, trade_date)
         except Exception as e:
-            print(f"[{v}] {trade_date}: fetch failed: {e}")
-            continue
+            rows = _empty()
+            fallback_note = (" -- trying Sina fallback"
+                            if use_sina_fallback and v in DCE_SINA_VARIETIES else "")
+            print(f"[{v}] {trade_date}: primary fetch failed ({e}){fallback_note}")
+        if rows.empty and use_sina_fallback and v in DCE_SINA_VARIETIES:
+            try:
+                rows = fetch_dce_sina_day(v, date_str)
+            except Exception as e:
+                print(f"[{v}] {trade_date}: Sina fallback also failed: {e}")
         if rows.empty:
             print(f"[{v}] {trade_date}: no data (non-trading day or not "
                   f"yet published)")
@@ -256,14 +390,31 @@ def run_day(varieties: list[str], trade_date: str, dry_run: bool = False,
 
 def run_backfill(varieties: list[str], start: str, end: str,
                  dry_run: bool = False) -> None:
+    dce_sina = [v for v in varieties if v in DCE_SINA_VARIETIES]
+    others = [v for v in varieties if v not in DCE_SINA_VARIETIES]
+
     d0 = datetime.strptime(start, "%Y%m%d").date()
     d1 = datetime.strptime(end, "%Y%m%d").date()
     d = d0
     while d <= d1:
         if d.weekday() < 5:  # Mon-Fri; akshare's own calendar check catches holidays
             print(f"=== {d.isoformat()} ===")
-            run_day(varieties, d.strftime("%Y%m%d"), dry_run=dry_run)
+            run_day(others, d.strftime("%Y%m%d"), dry_run=dry_run,
+                   use_sina_fallback=False)
         d += timedelta(days=1)
+
+    for v in dce_sina:
+        print(f"=== {v} (Sina, {start}-{end}) ===")
+        rows = fetch_dce_sina_backfill(v, start, end)
+        if rows.empty:
+            print(f"[{v}] no rows in range")
+            continue
+        n_dates = rows["date"].nunique()
+        if dry_run:
+            print(f"[{v}] {len(rows)} rows across {n_dates} dates (dry-run)")
+        else:
+            n = append_day(v, rows)
+            print(f"[{v}] {n} rows across {n_dates} dates written")
 
 
 if __name__ == "__main__":
