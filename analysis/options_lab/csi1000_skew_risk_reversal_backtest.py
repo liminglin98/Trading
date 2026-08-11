@@ -6,15 +6,16 @@ a small-cap-hedging-demand signature, not generic index skew).
 
 Two structures, run through the same engine via --structure:
   - risk_reversal (primary): short a target-delta OTM put + long a
-    target-delta OTM call, same expiry. Isolates the skew premium
-    specifically -- the short put collects the rich put vol, the long call
-    caps the tail-gap risk that made the put rich in the first place, and
-    the pair stays closer to vol-neutral than an outright short put. Still
-    carries real delta exposure from the strike asymmetry, and real gap
-    risk on exactly the small-cap-crash scenarios that price the put rich
-    (see the Feb-2024 DMA-liquidation check in csi1000_put_skew_check.py) --
-    that's the risk this structure is being paid to bear, not a flaw in the
-    backtest.
+    target-delta OTM call, same expiry. Intended to isolate the skew
+    premium -- the short put collects the rich put vol, the long call caps
+    the tail-gap risk that made the put rich in the first place. CORRECTION
+    (2026-08-11, prompted by a user question about why the discovery period
+    lost money): this structure is NOT close to vol-neutral in absolute
+    terms -- both legs contribute positive delta (short put ~ long-delta,
+    long call = long-delta), measured net position delta ~+0.39 at entry,
+    essentially a ~40%-delta bullish bet on CSI1000. See
+    delta_hedge_overlay() and the "Measured results" section below: once
+    that beta is hedged out, this structure's edge does NOT survive.
   - strangle (control): short OTM call + short OTM put, same target delta on
     both sides -- the generic short-vol / variance-risk-premium structure
     every other short-vol script in this repo already sells. Comparing the
@@ -52,21 +53,33 @@ delta"), isolating the entry-time skew premium independent of what happens
 to spot/vol afterward -- see skew_credit_decomposition(). Cross-checked
 against the first-order vega approximation vega*(put_iv-call_iv).
 
-Measured results (2026-08-11, target_delta=0.20, dte=[15,45], full history
-2022-07-22 to 2026-08-10; see skew_signal_investigation_leaderboard.md #4
-for the full writeup): risk_reversal (n=96) total pnl +70,560 yuan, 33% win
-rate (asymmetric-payoff signature -- most trades are small stop-losses,
-gains come from the minority held to expiry); discovery (<2024) -24,500
-yuan / -0.17% mean_r, holdout (>=2024) +95,060 yuan / +3.24% mean_r -- the
-edge does not decay post-2024, if anything strengthens. The strangle
-control (n=77) is net negative in BOTH periods (-33,160 / -209,480 yuan),
-confirming the risk-reversal's edge is skew-specific, not generic
-short-vol harvesting. Skew-credit decomposition: mean +1,408 yuan/trade,
-91% of trades positive at entry, corr=1.00 vs. the vega approximation --
-realized mean pnl/trade (~735 yuan) runs below this, consistent with part
-of the entry-time edge being eaten by the same small-cap gap risk that
-prices the put rich to begin with. Not yet swept over target_delta/DTE --
-these numbers are one parameter cell, not a validated optimum.
+Measured results, UNHEDGED (2026-08-11, target_delta=0.20, dte=[15,45], full
+history 2022-07-22 to 2026-08-10; see skew_signal_investigation_leaderboard.md
+#4 for the full writeup): risk_reversal (n=96) total pnl +70,560 yuan, 33%
+win rate; discovery (<2024) -24,500 yuan, holdout (>=2024) +95,060 yuan. At
+face value this looked like "the edge doesn't decay post-2024" and beat the
+strangle control (net negative in both periods, -33,160 / -209,480 yuan).
+**That read is confounded by direction and should not be trusted on its
+own**: CSI1000 fell -15.3% over the discovery window and rose +30.6% over
+the holdout window, and the risk-reversal's ~+0.39 net delta means it was
+simply long CSI1000 through a period it fell, then a period it rose.
+
+Measured results, DELTA-HEDGED (delta_hedge_overlay(), same trades/strikes,
+daily-rebalanced hedge at the options-implied parity-forward spot -- see
+that function's docstring for the no-IM-futures-data caveat): risk_reversal
+flips to total pnl **-70,846 yuan**, negative in BOTH discovery (-15,856)
+and holdout (-54,991). The strangle control flips the other way, from
+-242,640 to roughly breakeven (+3,975). Entry-time skew-credit decomposition
+still shows a reliably positive edge (n=96, mean +1,408 yuan/trade, 91%
+positive, corr=1.00 vs. the vega approximation) -- the skew premium is real
+in the *pricing* at entry but this construction could not convert it into
+positive *realized*, direction-hedged P&L (residual correlation to
+direction after hedging: +0.54, likely from daily-only rebalancing and from
+stop-loss/max-hold exits being decided on unhedged P&L -- neither resolved
+here). **Bottom line: don't treat this as a validated tradeable edge.**
+Not yet swept over target_delta/DTE, and the hedge/exit-timing interaction
+above is a real, unresolved confound -- these numbers are one parameter
+cell with a known methodological gap, not a finished result.
 
 Usage:
     python csi1000_skew_risk_reversal_backtest.py --structure risk_reversal
@@ -164,6 +177,25 @@ def _prepped_chain(underlying: str, start_date: str | None = None) -> pd.DataFra
     if start_date is not None:
         chain = chain[chain[ds.C_DATE] >= pd.Timestamp(start_date)]
     return chain
+
+
+def _leg_delta_by_strike(day: pd.DataFrame, expiry: pd.Timestamp, cp: str, strike: float,
+                         spot: float) -> float | None:
+    """BS-derived delta for a single already-known (expiry, cp, strike),
+    for daily re-hedging -- cheaper than _leg_metrics since it doesn't
+    scan every strike, just inverts IV for the one contract already held."""
+    rows = day[(day[ds.C_EXPIRY] == expiry) & (day[ds.C_CP] == cp) &
+              (day[ds.C_STRIKE] == strike) & (day[ds.C_CLOSE] > 0)]
+    if rows.empty or spot <= 0:
+        return None
+    row = rows.iloc[0]
+    t = float(row[ds.C_DTE]) / 365.0
+    if t <= 0:
+        return None
+    iv = bs_iv.implied_vol(cp, spot, strike, t, float(row[ds.C_CLOSE]))
+    if iv != iv:
+        return None
+    return bs_iv.bs_delta(cp, spot, strike, t, iv)
 
 
 # ------------------------------------------------------------------ engine
@@ -319,6 +351,95 @@ def skew_credit_decomposition(trades: pd.DataFrame) -> dict:
         "vega_approx_mean_yuan": float(vega_approx.mean()) if len(vega_approx) else float("nan"),
         "corr_vs_vega_approx": float(edge.corr(vega_approx)) if len(vega_approx) > 1 else float("nan"),
     }
+
+
+# ------------------------------------------------------------------ delta hedge overlay
+def delta_hedge_overlay(trades: pd.DataFrame, underlying: str = UNDERLYING) -> pd.DataFrame:
+    """Daily-rebalanced delta-hedge overlay on an already-computed trades_df
+    -- entry/exit dates and strikes are NOT changed, this only asks "if the
+    resulting net delta (see run()'s docstring: the risk reversal carries
+    ~+0.4 delta, short put + long call both contribute positive delta, it's
+    NOT close to vol-neutral in absolute terms) had been hedged daily with
+    the underlying, how much of the realized P&L survives?" -- the honest
+    way to separate the skew-specific edge from directional beta to CSI1000
+    (measured: CSI1000 fell -15.3% over the discovery window and rose +30.6%
+    over the holdout window, which alone explains much of the discovery/
+    holdout P&L swing on the unhedged structure).
+
+    APPROXIMATION, flagged explicitly: this repo has no CFFEX index-futures
+    (IM) price history, so the hedge leg is modeled at the OPTION chain's
+    own put-call-parity-implied forward (ds.C_UND_CLOSE) rather than an
+    independently-sourced futures price, in the options' own ¥100/pt
+    multiplier terms (cffex_margin.MULTIPLIER) -- no separate futures basis,
+    margin, or transaction cost is modeled for the hedge leg, consistent
+    with this repo's zero-cost backtest convention throughout. In practice
+    IM futures trade very close to the options-implied forward (tight
+    arbitrage bound), so this is a reasonable proxy, not a fabricated price.
+
+    Hedge quantity is rebalanced once per trading day to bring portfolio
+    delta back to ~0 (recomputing each leg's BS delta from that day's own
+    close price), same BS-inversion machinery run() already uses at entry."""
+    chain = _prepped_chain(underlying)
+    by_date = dict(tuple(chain.groupby(ds.C_DATE)))
+
+    hedge_pnls = []
+    for _, tr in trades.iterrows():
+        call_dir = 1 if tr["structure"] == "risk_reversal" else -1
+        entry_date, exit_date = pd.Timestamp(tr["entry_date"]), pd.Timestamp(tr["exit_date"])
+        expiry = pd.Timestamp(tr["expiry"])
+        dates_in_range = sorted(d for d in by_date if entry_date <= pd.Timestamp(d) <= exit_date)
+        if not dates_in_range:
+            hedge_pnls.append(0.0)
+            continue
+
+        hedge_qty = -(call_dir * tr["call_delta_at_entry"] - tr["put_delta_at_entry"])
+        prev_spot = float(tr["entry_spot"])
+        total = 0.0
+        for dt in dates_in_range:
+            day = by_date[dt]
+            spot_rows = day[day[ds.C_UND_CLOSE].notna()]
+            spot = float(spot_rows[ds.C_UND_CLOSE].iloc[0]) if not spot_rows.empty else prev_spot
+            total += hedge_qty * (spot - prev_spot) * cm.MULTIPLIER
+            prev_spot = spot
+
+            call_d = _leg_delta_by_strike(day, expiry, "C", tr["call_strike"], spot)
+            put_d = _leg_delta_by_strike(day, expiry, "P", tr["put_strike"], spot)
+            call_d = call_d if call_d is not None else tr["call_delta_at_entry"]
+            put_d = put_d if put_d is not None else tr["put_delta_at_entry"]
+            hedge_qty = -(call_dir * call_d - put_d)
+        hedge_pnls.append(total)
+
+    out = trades.copy()
+    out["hedge_pnl_yuan"] = hedge_pnls
+    out["pnl_hedged_yuan"] = out["pnl"] * cm.MULTIPLIER + out["hedge_pnl_yuan"]
+    return out
+
+
+def report_hedge_comparison(trades_hedged: pd.DataFrame) -> None:
+    """Prints unhedged vs. delta-hedged total P&L, discovery/holdout split,
+    and the trade-level correlation between each trade's own realized
+    underlying return (exit_spot/entry_spot - 1) and its P&L -- unhedged
+    should show real correlation to direction, hedged should shrink toward
+    zero if the hedge overlay is actually doing its job."""
+    t = trades_hedged
+    t = t.assign(underlying_return=t["exit_spot"] / t["entry_spot"] - 1)
+    unhedged_yuan = t["pnl"] * cm.MULTIPLIER
+    hedged_yuan = t["pnl_hedged_yuan"]
+
+    print("\n=== delta-hedge overlay: unhedged vs. hedged ===")
+    print(f"  n={len(t)}")
+    for label, pnl in [("unhedged", unhedged_yuan), ("hedged", hedged_yuan)]:
+        disc = pnl[t["entry_date"] < SPLIT_DATE]
+        hold = pnl[t["entry_date"] >= SPLIT_DATE]
+        print(f"  {label:8s}: total={pnl.sum():>12,.0f} yuan  "
+              f"discovery={disc.sum():>12,.0f} (n={len(disc)})  "
+              f"holdout={hold.sum():>12,.0f} (n={len(hold)})  "
+              f"corr(pnl, underlying_return)={pnl.corr(t['underlying_return']):+.2f}")
+
+    dec = skew_credit_decomposition(t)
+    if dec.get("n"):
+        print(f"  for reference, entry-time skew-credit edge: mean={dec['mean_yuan']:,.0f} yuan/trade, "
+              f"{dec['pct_positive']:.0%} of trades positive at entry (unaffected by hedging, priced at entry)")
 
 
 # ------------------------------------------------------------------ report
@@ -487,7 +608,8 @@ def build_underlying_price_series(underlying: str = UNDERLYING) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ main
-def main(underlying: str, structure: str, target_delta: float, do_compare: bool) -> None:
+def main(underlying: str, structure: str, target_delta: float, do_compare: bool,
+        do_hedge: bool) -> None:
     if do_compare:
         compare_structures(underlying=underlying, target_delta=target_delta)
         return
@@ -497,6 +619,14 @@ def main(underlying: str, structure: str, target_delta: float, do_compare: bool)
     plot(res, structure, out_path, target_delta)
     print(f"  Chart saved to {out_path}\n")
 
+    if do_hedge:
+        trades_hedged = delta_hedge_overlay(res["trades"], underlying)
+        report_hedge_comparison(trades_hedged)
+        OUT_DIR.mkdir(exist_ok=True)
+        hedge_out = OUT_DIR / f"csi1000_skew_{structure}_trades_hedged_{underlying}_{target_delta:.2f}.csv"
+        trades_hedged.to_csv(hedge_out, index=False, encoding="utf-8-sig")
+        print(f"  Hedged trades saved to {hedge_out}\n")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -505,5 +635,8 @@ if __name__ == "__main__":
     ap.add_argument("--target-delta", type=float, default=TARGET_DELTA, dest="target_delta")
     ap.add_argument("--compare", action="store_true", dest="do_compare",
                     help="run both structures and report them side by side")
+    ap.add_argument("--delta-hedge", action="store_true", dest="do_hedge",
+                    help="overlay a daily-rebalanced delta hedge to isolate the skew-specific "
+                         "edge from directional beta to the underlying (see delta_hedge_overlay())")
     args = ap.parse_args()
-    main(args.underlying, args.structure, args.target_delta, args.do_compare)
+    main(args.underlying, args.structure, args.target_delta, args.do_compare, args.do_hedge)
