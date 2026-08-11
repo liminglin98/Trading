@@ -151,7 +151,7 @@ don't re-propose any of the above without a genuinely different construction
 (a longer/higher-quality skew history, a persistence-based rather than
 level-based gate, or a structure not yet tried here).
 
-## 4. CSI1000 put-skew risk reversal — DONE, REVISED TO NEGATIVE once delta-hedged
+## 4. CSI1000 put-skew risk reversal — DONE, REJECTED (negative, confirmed across two hedging methodologies)
 
 `csi1000_put_skew_check.py` (measurement) + `csi1000_skew_risk_reversal_backtest.py`
 (harvesting). Different underlying (000852/MO, CFFEX) and different skew
@@ -194,70 +194,94 @@ periods. It's a ~40%-delta bullish bet on CSI1000 dressed up as a skew
 harvest; unhedged pnl correlates +0.93 with each trade's own realized
 underlying return.**
 
-`delta_hedge_overlay()` tests what survives once that beta is stripped out:
-daily-rebalanced BS-delta hedge (priced at the options' own parity-forward
-spot -- no CFFEX index-futures/IM price history exists in this repo, so this
-is a proxy, not an independently-sourced futures price; no separate hedge
-transaction cost/margin modeled, consistent with this repo's zero-cost
-convention). Entry/exit dates and strikes are unchanged from the runs above.
+**First hedge attempt (`delta_hedge_overlay()`, KNOWN FLAWED, kept for
+reference)**: daily-rebalanced BS-delta hedge layered on top of the SAME
+fixed trade schedule the unhedged run above already decided (entries/exits
+unchanged). Priced at the options' own parity-forward spot (no CFFEX
+index-futures/IM price history exists in this repo, so this is a proxy, not
+an independently-sourced futures price; no separate hedge transaction cost
+modeled).
 
-| Structure | Unhedged total | Hedged total | Hedged discovery | Hedged holdout | corr(pnl, underlying_return) unhedged -> hedged |
+| Structure | Unhedged total | Overlay-hedged total | corr(pnl, underlying_return) unhedged -> overlay-hedged |
+|---|---|---|---|
+| risk_reversal | +70,560 | -70,846 yuan | +0.93 -> +0.54 |
+| strangle | -242,640 | +3,975 yuan | +0.05 -> +0.32 |
+
+This already flips both structures' sign, but the residual +0.54/+0.32
+correlation to direction was suspicious -- a real hedge shouldn't leave that
+much directional dependence. Root cause, found on inspection: the SAME
+unhedged P&L that's supposedly being hedged away is also what decided which
+trades got stopped out vs. held to expiry (`stop_loss_mult`/`max_hold`
+checked against unhedged pnl). A hedged position was being exited on an
+unhedged trigger -- selection bias, not just a rebalancing-frequency
+limitation.
+
+**Fix (`run(..., delta_hedge=True)`, the corrected version)**: exits are now
+decided on the hedged P&L itself (option pnl + accumulated daily hedge pnl),
+not the unhedged option pnl -- the hedge is now inside the strategy's own
+risk management, not bolted on after the fact. Trade counts and holding
+periods genuinely differ from the unhedged run (fewer stop-outs, longer
+average holds), which is expected: a hedged position reacts to different
+risk than an unhedged one.
+
+| Structure | Corrected-hedged total | Discovery | Holdout | By-year sign | corr(pnl, underlying_return) |
 |---|---|---|---|---|---|
-| risk_reversal | +70,560 | **-70,846 yuan** | -15,856 | -54,991 | +0.93 -> +0.54 |
-| strangle | -242,640 | **+3,975 yuan** | +24,439 | -20,464 | +0.05 -> +0.32 |
+| risk_reversal | **-137,099 yuan** (n=63) | -10,285 | -126,813 | negative 4 of 5 years, worst 2025 (11% win rate) | +0.14 |
+| strangle | **+77,702 yuan** (n=55) | +34,779 | +42,924 | **positive every year 2022-2026** | (not separately computed; already near-neutral pre-hedge) |
 
-Once hedged, risk_reversal is net negative in **both** periods -- the
-"holdout doesn't decay" result above was mostly the post-2024 CSI1000 rally,
-not a validated skew harvest. The strangle's flip (strongly negative ->
-roughly breakeven) is a separate, informative side-finding: even though it's
-delta-neutral *at entry*, delta drifts over each ~12-day hold as spot/time
-move, and unhedged correlation-with-direction being near zero (+0.05)
-doesn't mean direction-free P&L -- it can still bleed from gamma effects
-uncorrelated with return *sign* but not with return *magnitude*.
+The correlation drop (+0.93 -> +0.14 for risk_reversal, vs. only -> +0.54
+with the flawed overlay) confirms the exit-timing bug was the dominant
+source of the earlier residual, not daily-only rebalancing (which remains
+an approximation -- this repo has no historical intraday CFFEX option data
+to rebalance against more finely -- but is evidently a second-order effect
+next to the exit-timing fix).
 
-The residual correlation after hedging (+0.54 for risk_reversal, +0.32 for
-strangle) is not zero -- two likely reasons, not resolved here: (1) daily
-(not continuous) rebalancing leaves real residual gamma exposure on a
-higher-vol underlying between rebalances, and (2) exits are decided on
-UNHEDGED P&L (stop-loss/max-hold), so the sample of trades that get stopped
-out vs. held to expiry is itself selected on realized direction -- a hedged
-position is being exited on an unhedged trigger, which can realize hedge
-losses at systematically bad points. Neither is fixed here.
+**Fixing the bug made the result MORE decisively negative for
+risk_reversal, not less.** The properly hedged strangle, by contrast, is
+now solidly and consistently profitable (positive every calendar year,
+sharpe(daily,ann)=0.73) -- the generic variance risk premium (already
+validated on other underlyings via this repo's vrp signal) is real and
+harvestable on CSI1000 too. The skew-tilted risk reversal does not add to
+it; once direction is controlled for, it actively underperforms the plain
+symmetric strangle.
 
 Entry-time skew-credit decomposition (actual put price vs. counterfactual
-at the call leg's own IV) still shows a reliably positive edge at entry:
-n=96, mean +1,408 yuan/trade, 91% of trades positive, cross-checked against
-the vega approximation (corr=1.00). **This is the key tension the hedge
-overlay exposes**: the skew premium is real in the option *pricing* at
-entry, but this backtest could not convert it into positive *realized*,
-direction-hedged P&L -- consistent with the possibility flagged when this
-script was first built, that "the edge exists at entry but gets eaten by
-the same gap risk that makes puts rich in the first place," now confirmed
-rather than hypothetical.
+at the call leg's own IV) still shows a reliably positive edge at entry on
+the risk_reversal's own trades: n=63, mean +1,358 yuan/trade, 94% positive,
+corr=1.00 vs. the vega approximation. **This is the central finding**: the
+skew premium is genuinely priced into CSI1000 puts at entry (this part of
+the original claim, from `csi1000_put_skew_check.py`, was always solid and
+remains so) -- but tilting a structure toward harvesting it specifically,
+even properly delta-hedged, does not produce better realized P&L than just
+selling vol symmetrically. Whatever eats the entry-time edge (small-cap gap
+risk realized during the hold, most plausibly) eats it selectively on the
+put-skewed structure and not on the symmetric one.
 
 **Caveat, not a footnote**: CFFEX margin_ratio/min_guarantee are MO's 2022
 launch-date parameters, held static across the whole window -- no verified
 historical revision schedule was locatable (`cffex_margin.py` docstring).
-This affects only return-on-margin/leverage figures (not computed for the
-hedged numbers above, which are yuan P&L only).
+This affects only return-on-margin/leverage figures, not the yuan P&L
+totals above.
 
-**Conclusion: REVISED from the initial unhedged read.** The unhedged
-"risk_reversal beats strangle, doesn't decay post-2024" result was
-substantially explained by CSI1000's realized direction (down in discovery,
-up in holdout) interacting with the risk-reversal's ~+0.4 built-in delta
-tilt, not by a cleanly isolated skew premium. Once delta-hedged, this
-specific construction (20-delta risk reversal, unhedged-P&L-based
-stop-loss/max-hold exits, daily rebalancing) is net negative in both
-periods, despite the entry-time skew edge being reliably positive. **Don't
-treat this as a validated tradeable edge.** The entry-time pricing
-observation (CSI1000 puts really are persistently rich, see
-`csi1000_put_skew_check.py`) stands; converting it into hedged, realized
-P&L does not currently work with this construction. Possible follow-ups
-(not done here): exits based on hedged rather than unhedged P&L, finer
-(intraday) rebalancing, a construction with tighter native gamma matching
-between legs, or accepting that some directional exposure is unavoidable
-and sizing/measuring it deliberately rather than treating it as
-close-to-neutral.
+**Conclusion: REVISED TWICE, converging on a clear negative.** Unhedged,
+this looked like a clean, holdout-confirmed skew harvest (+70,560 yuan,
+"doesn't decay") -- that was CSI1000's realized direction (down in
+discovery, up in holdout) interacting with the risk-reversal's ~+0.4 net
+delta, not a skew-specific edge. The first hedge attempt (flawed
+exit-timing) still showed a negative but smaller (-70,846) result. The
+corrected hedge (exits on hedged P&L) is more negative still (-137,099),
+while the same fix applied to the strangle control turns it solidly
+profitable (+77,702, positive every year). **Don't treat the CSI1000 skew
+risk reversal as a validated tradeable edge -- the entry-time pricing
+observation is real, but this repo's attempts to harvest it specifically
+(as opposed to just harvesting the generic variance risk premium CSI1000
+already offers) have not worked, across two independent hedging
+methodologies.** Remaining open question, not resolved here: whether a
+different construction (tighter native gamma matching between legs, a
+persistence-gated entry rather than always-on, or accepting the directional
+exposure deliberately rather than fighting it) could still capture something
+skew-specific -- but the burden of proof is now higher given two negative
+results in a row.
 
 ## Scripts
 

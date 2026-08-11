@@ -1,8 +1,12 @@
-"""csi1000_skew_risk_reversal_backtest.py -- backtest harvesting the CSI1000
+"""csi1000_skew_risk_reversal_backtest.py -- tests whether the CSI1000
 (000852/MO) put-IV skew premium documented in csi1000_put_skew_check.py
 (5%-OTM put IV richer than call IV on 88.5% of days, mean 2.24 vol pts,
 2022-07-22 to 2026-08-10, vs. much weaker CSI300/near-zero SSE50 controls --
-a small-cap-hedging-demand signature, not generic index skew).
+a small-cap-hedging-demand signature, not generic index skew) is actually
+harvestable. RESULT (see "Measured results, DELTA-HEDGED, CORRECTED" below):
+no -- once directional beta is properly hedged out, this is not a validated
+tradeable edge. Kept as a documented negative result and as the reference
+delta-hedging pattern for future option-backtest scripts in this repo.
 
 Two structures, run through the same engine via --structure:
   - risk_reversal (primary): short a target-delta OTM put + long a
@@ -64,22 +68,42 @@ own**: CSI1000 fell -15.3% over the discovery window and rose +30.6% over
 the holdout window, and the risk-reversal's ~+0.39 net delta means it was
 simply long CSI1000 through a period it fell, then a period it rose.
 
-Measured results, DELTA-HEDGED (delta_hedge_overlay(), same trades/strikes,
-daily-rebalanced hedge at the options-implied parity-forward spot -- see
-that function's docstring for the no-IM-futures-data caveat): risk_reversal
-flips to total pnl **-70,846 yuan**, negative in BOTH discovery (-15,856)
-and holdout (-54,991). The strangle control flips the other way, from
--242,640 to roughly breakeven (+3,975). Entry-time skew-credit decomposition
-still shows a reliably positive edge (n=96, mean +1,408 yuan/trade, 91%
-positive, corr=1.00 vs. the vega approximation) -- the skew premium is real
-in the *pricing* at entry but this construction could not convert it into
-positive *realized*, direction-hedged P&L (residual correlation to
-direction after hedging: +0.54, likely from daily-only rebalancing and from
-stop-loss/max-hold exits being decided on unhedged P&L -- neither resolved
-here). **Bottom line: don't treat this as a validated tradeable edge.**
-Not yet swept over target_delta/DTE, and the hedge/exit-timing interaction
-above is a real, unresolved confound -- these numbers are one parameter
-cell with a known methodological gap, not a finished result.
+Measured results, DELTA-HEDGED, FIRST PASS (delta_hedge_overlay(), a fixed
+unhedged-decided trade schedule with hedge pnl layered on top -- kept for
+reference, KNOWN FLAWED): risk_reversal -70,846 yuan, strangle +3,975 yuan.
+Residual correlation to direction only dropped 0.93 -> 0.54 -- the fixed
+trade schedule (decided on unhedged P&L, i.e. exactly the direction being
+hedged) was itself the main source of the leftover confound.
+
+Measured results, DELTA-HEDGED, CORRECTED (run(..., delta_hedge=True): exits
+now decided on hedged P&L, not unhedged -- see the class docstring above.
+Trade count and holding periods genuinely differ from the unhedged run,
+which is expected): residual correlation to direction drops to +0.14 for
+risk_reversal (vs. +0.93 unhedged, +0.54 with the flawed overlay) --
+confirms the exit-timing bug, not just rebalancing frequency, was the
+dominant source of the earlier residual. With that fixed:
+  - risk_reversal (n=63, avg_hold=14.3d): total pnl **-137,099 yuan**,
+    win_rate 30%, negative in discovery (-10,285) AND holdout (-126,813,
+    worst in 2025 at 11% win rate). WORSE than the flawed overlay's number,
+    not better -- fixing the bug did not rescue the structure.
+  - strangle control (n=55, avg_hold=16.5d): total pnl **+77,702 yuan**,
+    win_rate 75%, POSITIVE in discovery (+34,779) AND holdout (+42,924),
+    positive every calendar year 2022-2026, sharpe(daily,ann)=0.73.
+
+Entry-time skew-credit decomposition still shows a reliably positive edge
+on the risk_reversal's own trades (n=63, mean +1,358 yuan, 94% positive,
+corr=1.00 vs. the vega approximation) -- the skew premium is genuinely
+priced into the put at entry. **But once direction is properly hedged out,
+tilting toward that skew (short put + long call) UNDERPERFORMS a plain
+symmetric short strangle, not just fails to beat it.** The generic variance
+risk premium (already validated elsewhere in this repo via the vrp signal)
+is what's actually harvestable on CSI1000 -- this exercise does not surface
+a separate, additional skew-specific edge on top of it. Daily-only
+rebalancing remains an approximation (this repo has no historical intraday
+CFFEX option data), but the +0.14 residual correlation suggests it's a
+minor factor next to the exit-timing fix. **Bottom line: don't treat the
+CSI1000 skew risk reversal as a validated tradeable edge.** Not yet swept
+over target_delta/DTE.
 
 Usage:
     python csi1000_skew_risk_reversal_backtest.py --structure risk_reversal
@@ -203,14 +227,33 @@ def run(underlying: str = UNDERLYING, structure: str = "risk_reversal",
        target_delta: float = TARGET_DELTA, call_target_delta: float | None = None,
        dte_min: int = DTE_MIN, dte_max: int = DTE_MAX, max_hold_days: int = MAX_HOLD_DAYS,
        stop_loss_mult: float = STOP_LOSS_MULT, profit_target_mult: float | None = PROFIT_TARGET_MULT,
-       start_date: str | None = None) -> dict:
+       start_date: str | None = None, delta_hedge: bool = False) -> dict:
     """structure: "risk_reversal" (short put + long call) or "strangle"
     (short put + short call), both delta-targeted, always-on roll (re-enter
     immediately the day a position closes -- the discovery script found the
     put premium present on 88.5% of days, i.e. structural, not event-driven,
     so no entry signal gate is used). profit_target_mult is ignored for
     risk_reversal (its asymmetric payoff is the point; capping gains early
-    defeats the structure)."""
+    defeats the structure).
+
+    delta_hedge=True: rebalances a hedge daily against the net option delta
+    (priced at the options-implied parity-forward spot -- no CFFEX index-
+    futures/IM price history exists in this repo, see delta_hedge_overlay()'s
+    docstring for the same caveat) AND, critically, feeds the HEDGED mark
+    (option pnl + accumulated hedge pnl) into the stop_loss/profit_target/
+    max_hold exit checks instead of the unhedged option pnl. This is the
+    fix for a real bug in the original standalone delta_hedge_overlay()
+    (still present below, kept for comparison): that function hedged a
+    fixed trade schedule whose entries/exits had already been decided on
+    UNHEDGED P&L, which selects the sample of "held to expiry" vs. "stopped
+    out" trades on the very direction the hedge is supposed to remove.
+    Entry/exit dates from a delta_hedge=True run will genuinely differ from
+    an unhedged run of the same parameters -- that's expected, not a bug:
+    a properly hedged position has different risk to react to. Rebalancing
+    stays daily (this repo has no historical intraday CFFEX option data --
+    minute_updater.py only captures the current live trading day, not a
+    backtestable history), so residual gamma exposure between rebalances is
+    a remaining, unresolved approximation, not eliminated by this fix."""
     assert structure in ("risk_reversal", "strangle")
     call_target_delta = call_target_delta if call_target_delta is not None else target_delta
     chain = _prepped_chain(underlying, start_date)
@@ -249,16 +292,32 @@ def run(underlying: str = UNDERLYING, structure: str = "risk_reversal",
             pnl = mark - open_pos["cost"]
             basis = abs(open_pos["cost"]) if open_pos["cost"] != 0 else (call_px + put_px)
 
+            hedge_pnl = 0.0
+            if delta_hedge:
+                # points, not yuan -- matches "pnl"/"cost"'s units (all *cm.MULTIPLIER
+                # downstream in report()), NOT delta_hedge_overlay()'s "_yuan"-suffixed
+                # columns which are already scaled.
+                hedge_pnl = open_pos["hedge_qty"] * (spot - open_pos["last_hedge_spot"])
+                open_pos["hedge_pnl_accum"] += hedge_pnl
+                open_pos["last_hedge_spot"] = spot
+                if not expired:
+                    call_d = _leg_delta_by_strike(day, open_pos["expiry"], "C", open_pos["call_strike"], spot)
+                    put_d = _leg_delta_by_strike(day, open_pos["expiry"], "P", open_pos["put_strike"], spot)
+                    open_pos["last_call_delta"] = call_d if call_d is not None else open_pos["last_call_delta"]
+                    open_pos["last_put_delta"] = put_d if put_d is not None else open_pos["last_put_delta"]
+                    open_pos["hedge_qty"] = -(call_sign * open_pos["last_call_delta"] - open_pos["last_put_delta"])
+            pnl_for_exit = pnl + open_pos["hedge_pnl_accum"] if delta_hedge else pnl
+
             if reason is None:
-                if stop_loss_mult is not None and pnl <= -stop_loss_mult * basis:
+                if stop_loss_mult is not None and pnl_for_exit <= -stop_loss_mult * basis:
                     reason = "stop_loss"
-                elif structure == "strangle" and profit_target_mult is not None and pnl >= profit_target_mult * basis:
+                elif structure == "strangle" and profit_target_mult is not None and pnl_for_exit >= profit_target_mult * basis:
                     reason = "profit_target"
                 elif days_held >= max_hold_days:
                     reason = "max_hold"
 
             if reason:
-                realized += pnl
+                realized += pnl_for_exit
                 trades.append({
                     "structure": structure, "entry_date": open_pos["entry_date"], "exit_date": dt,
                     "expiry": open_pos["expiry"], "exit_reason": reason,
@@ -273,12 +332,13 @@ def run(underlying: str = UNDERLYING, structure: str = "risk_reversal",
                     "skew_edge_yuan": open_pos.get("skew_edge_yuan"),
                     "vega_approx_edge_yuan": open_pos.get("vega_approx_edge_yuan"),
                     "net_cost": open_pos["cost"], "pnl": pnl,
+                    "hedge_pnl": open_pos.get("hedge_pnl_accum", 0.0), "pnl_hedged": pnl_for_exit,
                     "days_held": days_held, "margin_yuan": open_pos["margin"],
                 })
                 open_pos = None
                 equity_rows.append({"date": dt, "equity": realized, "open_pnl": 0.0, "spot": spot})
                 continue
-            equity_rows.append({"date": dt, "equity": realized + pnl, "open_pnl": pnl, "spot": spot})
+            equity_rows.append({"date": dt, "equity": realized + pnl_for_exit, "open_pnl": pnl_for_exit, "spot": spot})
             continue
 
         # ---- entry: always-on roll, near-month expiry in [dte_min, dte_max]
@@ -325,6 +385,12 @@ def run(underlying: str = UNDERLYING, structure: str = "risk_reversal",
                         "skew_edge_yuan": skew_edge_yuan,
                         "vega_approx_edge_yuan": vega_approx_edge_yuan,
                     }
+                    if delta_hedge:
+                        call_d, put_d = float(call_row["bs_delta"]), float(put_row["bs_delta"])
+                        open_pos["hedge_qty"] = -(call_dir * call_d - put_d)
+                        open_pos["hedge_pnl_accum"] = 0.0
+                        open_pos["last_hedge_spot"] = spot
+                        open_pos["last_call_delta"], open_pos["last_put_delta"] = call_d, put_d
         equity_rows.append({"date": dt, "equity": realized, "open_pnl": 0.0, "spot": spot})
 
     trades_df = pd.DataFrame(trades)
@@ -449,22 +515,28 @@ def _split(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return disc, hold
 
 
-def _period_stats(trades: pd.DataFrame) -> dict:
+def _period_stats(trades: pd.DataFrame, pnl_col: str = "pnl") -> dict:
     if trades.empty:
         return {"n": 0, "total_pnl": np.nan, "mean_r": np.nan, "win_rate": np.nan}
-    pnl_yuan = trades["pnl"] * cm.MULTIPLIER
+    pnl_yuan = trades[pnl_col] * cm.MULTIPLIER
     r = pnl_yuan / trades["margin_yuan"]
     return {"n": len(trades), "total_pnl": float(pnl_yuan.sum()),
-            "mean_r": float(r.mean()), "win_rate": float((trades["pnl"] > 0).mean())}
+            "mean_r": float(r.mean()), "win_rate": float((trades[pnl_col] > 0).mean())}
 
 
 def report(res: dict, underlying: str = UNDERLYING, structure: str = "risk_reversal",
-          target_delta: float = TARGET_DELTA) -> None:
+          target_delta: float = TARGET_DELTA, delta_hedge: bool = False) -> None:
+    """delta_hedge=True: headline stats (total_pnl, win_rate, mean_r, drawdown,
+    sharpe, discovery/holdout) use "pnl_hedged" (option pnl + accumulated daily
+    hedge pnl, which also drove this run's exit decisions -- see run()'s
+    docstring) instead of the unhedged "pnl" column. Both are printed so the
+    directional-beta contribution stays visible, not just the hedged number."""
     trades, equity = res["trades"], res["equity"]
     if trades.empty:
         print(f"{underlying} ({UNDERLYING_NAME}) [{structure}]: no trades.")
         return
-    pnl_yuan = trades["pnl"] * cm.MULTIPLIER
+    pnl_col = "pnl_hedged" if delta_hedge else "pnl"
+    pnl_yuan = trades[pnl_col] * cm.MULTIPLIER
     eq = equity.set_index("date")["equity"] * cm.MULTIPLIER
     dd = eq - eq.cummax()
     daily = eq.diff().dropna()
@@ -474,21 +546,26 @@ def report(res: dict, underlying: str = UNDERLYING, structure: str = "risk_rever
     span_years = (equity["date"].max() - equity["date"].min()).days / 365.25
     return_on_margin_yr = (total_pnl / avg_margin) / span_years if span_years > 0 and avg_margin else np.nan
 
-    print(f"{underlying} ({UNDERLYING_NAME}) [{structure}]: target_delta={target_delta:.2f}, "
+    hedge_tag = " [DELTA-HEDGED, exits decided on hedged P&L]" if delta_hedge else ""
+    print(f"{underlying} ({UNDERLYING_NAME}) [{structure}]{hedge_tag}: target_delta={target_delta:.2f}, "
           f"dte=[{DTE_MIN},{DTE_MAX}], max_hold={MAX_HOLD_DAYS}d, stop_loss={STOP_LOSS_MULT:.1f}x")
     print(f"  {equity['date'].min().date()} -> {equity['date'].max().date()}")
     print(f"  n_trades={len(trades)}  avg_days_held={trades['days_held'].mean():.1f}  "
           f"avg call/put BS-delta at entry={trades['call_delta_at_entry'].mean():+.2f}/"
           f"{trades['put_delta_at_entry'].mean():+.2f}")
-    print(f"  total_pnl={total_pnl:,.0f} yuan  win_rate={(trades['pnl']>0).mean():.0%}  "
+    print(f"  total_pnl={total_pnl:,.0f} yuan  win_rate={(trades[pnl_col]>0).mean():.0%}  "
           f"mean_r={(pnl_yuan/trades['margin_yuan']).mean():+.2%} (pnl/margin per trade)")
+    if delta_hedge:
+        unhedged_total = (trades["pnl"] * cm.MULTIPLIER).sum()
+        print(f"  (for reference, unhedged option-only total_pnl over these SAME trades: "
+              f"{unhedged_total:,.0f} yuan -- the gap is what the hedge removed/added)")
     print(f"  max_drawdown={dd.min():,.0f} yuan  sharpe(daily,ann)={sharpe:.2f}")
     print(f"  avg entry margin (CFFEX naked, APPROX -- see cffex_margin.py caveat)={avg_margin:,.0f} yuan  "
           f"return_on_margin/yr~={return_on_margin_yr:.1%}")
     print("  exit reasons:", trades["exit_reason"].value_counts().to_dict())
 
     disc, hold = _split(trades)
-    d_stats, h_stats = _period_stats(disc), _period_stats(hold)
+    d_stats, h_stats = _period_stats(disc, pnl_col), _period_stats(hold, pnl_col)
     print(f"  discovery (<{SPLIT_DATE.date()}): n={d_stats['n']}  total_pnl={d_stats['total_pnl']:,.0f}  "
           f"mean_r={d_stats['mean_r']:+.2%}  win_rate={d_stats['win_rate']:.0%}" if d_stats["n"] else
           f"  discovery (<{SPLIT_DATE.date()}): no trades")
@@ -508,15 +585,17 @@ def report(res: dict, underlying: str = UNDERLYING, structure: str = "risk_rever
     trades["year"] = trades["entry_date"].dt.year
     print("  by year:")
     for yr, g in trades.groupby("year"):
-        print(f"    {yr}: n={len(g)}  pnl={g['pnl'].sum()*cm.MULTIPLIER:>10,.0f}  win%={(g['pnl']>0).mean():.0%}")
+        print(f"    {yr}: n={len(g)}  pnl={g[pnl_col].sum()*cm.MULTIPLIER:>10,.0f}  win%={(g[pnl_col]>0).mean():.0%}")
 
     OUT_DIR.mkdir(exist_ok=True)
-    trades_out = OUT_DIR / f"csi1000_skew_{structure}_trades_{underlying}_{target_delta:.2f}.csv"
+    suffix = "_hedged" if delta_hedge else ""
+    trades_out = OUT_DIR / f"csi1000_skew_{structure}_trades{suffix}_{underlying}_{target_delta:.2f}.csv"
     trades.to_csv(trades_out, index=False, encoding="utf-8-sig")
     print(f"  Trades saved to {trades_out}\n")
 
 
-def plot(res: dict, structure: str, out_path: Path, target_delta: float = TARGET_DELTA) -> None:
+def plot(res: dict, structure: str, out_path: Path, target_delta: float = TARGET_DELTA,
+        delta_hedge: bool = False) -> None:
     equity = res["equity"]
     eq = equity.set_index("date")["equity"] * cm.MULTIPLIER
     dd = eq - eq.cummax()
@@ -536,7 +615,8 @@ def plot(res: dict, structure: str, out_path: Path, target_delta: float = TARGET
 
     ax1.plot(eq.index, eq.values, color=C_BLUE, linewidth=1.6)
     ax1.set_ylabel("cumulative P&L (yuan)", color=C_INK2, fontsize=10)
-    ax1.set_title(f"{UNDERLYING_NAME}: skew {structure} (target_delta={target_delta:.2f})",
+    hedge_tag = ", delta-hedged" if delta_hedge else ""
+    ax1.set_title(f"{UNDERLYING_NAME}: skew {structure} (target_delta={target_delta:.2f}{hedge_tag})",
                   color=C_INK, fontsize=12, loc="left", pad=10)
 
     ax2.fill_between(dd.index, 0, dd.values, color=C_RED, alpha=0.55, linewidth=0)
@@ -609,7 +689,7 @@ def build_underlying_price_series(underlying: str = UNDERLYING) -> pd.DataFrame:
 
 # ------------------------------------------------------------------ main
 def main(underlying: str, structure: str, target_delta: float, do_compare: bool,
-        do_hedge: bool) -> None:
+        do_hedge: bool, legacy_overlay: bool = False) -> None:
     if do_compare:
         compare_structures(underlying=underlying, target_delta=target_delta)
         return
@@ -620,12 +700,24 @@ def main(underlying: str, structure: str, target_delta: float, do_compare: bool,
     print(f"  Chart saved to {out_path}\n")
 
     if do_hedge:
-        trades_hedged = delta_hedge_overlay(res["trades"], underlying)
-        report_hedge_comparison(trades_hedged)
-        OUT_DIR.mkdir(exist_ok=True)
-        hedge_out = OUT_DIR / f"csi1000_skew_{structure}_trades_hedged_{underlying}_{target_delta:.2f}.csv"
-        trades_hedged.to_csv(hedge_out, index=False, encoding="utf-8-sig")
-        print(f"  Hedged trades saved to {hedge_out}\n")
+        print("=" * 70)
+        print("NATIVE delta-hedged run (exits decided on hedged P&L -- the fix; "
+              "entry/exit dates below WILL differ from the unhedged run above, "
+              "as expected: a hedged position reacts to different risk)")
+        print("=" * 70)
+        res_hedged = run(underlying=underlying, structure=structure, target_delta=target_delta,
+                         delta_hedge=True)
+        report(res_hedged, underlying, structure, target_delta, delta_hedge=True)
+        hedge_plot_path = OUT_DIR / f"csi1000_skew_{structure}_{underlying}_{target_delta:.2f}_hedged.png"
+        plot(res_hedged, structure, hedge_plot_path, target_delta, delta_hedge=True)
+        print(f"  Chart saved to {hedge_plot_path}\n")
+
+        if legacy_overlay:
+            print("-" * 70)
+            print("For comparison, the OLD overlay method (known selection-bias flaw: "
+                  "hedges the UNHEDGED run's fixed trade schedule -- see run()'s docstring):")
+            trades_hedged_overlay = delta_hedge_overlay(res["trades"], underlying)
+            report_hedge_comparison(trades_hedged_overlay)
 
 
 if __name__ == "__main__":
@@ -636,7 +728,11 @@ if __name__ == "__main__":
     ap.add_argument("--compare", action="store_true", dest="do_compare",
                     help="run both structures and report them side by side")
     ap.add_argument("--delta-hedge", action="store_true", dest="do_hedge",
-                    help="overlay a daily-rebalanced delta hedge to isolate the skew-specific "
-                         "edge from directional beta to the underlying (see delta_hedge_overlay())")
+                    help="run natively delta-hedged (exits decided on hedged P&L, not just "
+                         "hedge P&L overlaid on unhedged-decided trades -- see run()'s docstring) "
+                         "to isolate the skew-specific edge from directional beta")
+    ap.add_argument("--legacy-overlay", action="store_true", dest="legacy_overlay",
+                    help="also print the old, known-flawed overlay-hedge number for comparison")
     args = ap.parse_args()
-    main(args.underlying, args.structure, args.target_delta, args.do_compare, args.do_hedge)
+    main(args.underlying, args.structure, args.target_delta, args.do_compare, args.do_hedge,
+        args.legacy_overlay)
