@@ -112,8 +112,13 @@ def load_chain(underlying: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     df = pd.read_csv(path, encoding="utf-8-sig", dtype={C_CODE: str, C_UND: str})
-    df[C_DATE] = pd.to_datetime(df[C_DATE])
-    df[C_EXPIRY] = pd.to_datetime(df[C_EXPIRY])
+    df[C_DATE] = pd.to_datetime(df[C_DATE], errors="coerce")
+    df[C_EXPIRY] = pd.to_datetime(df[C_EXPIRY], errors="coerce")
+    n_bad = df[C_DATE].isna().sum()
+    if n_bad:
+        print(f"[WARN] {path.name}: dropping {n_bad} row(s) with unparseable "
+              f"{C_DATE!r} (corrupt data on file)")
+        df = df[df[C_DATE].notna()]
     for col in (C_STRIKE, C_CLOSE, C_SETTLE, C_OPEN, C_HIGH, C_LOW, C_VOL,
                 C_OI, C_DELTA, C_THETA, C_GAMMA, C_VEGA, C_IV, C_UND_CLOSE,
                 C_DTE, C_PREV_SETTLE, C_PREV_CLOSE):
@@ -132,15 +137,52 @@ def load_etf_ohlc(underlying: str) -> pd.DataFrame | None:
     return df.sort_values("date").reset_index(drop=True)
 
 
+def index_ohlc_path(underlying: str) -> Path:
+    return REPO / "Data" / "index" / f"index_daily_{underlying}.csv"
+
+
+def load_underlying_ohlc(underlying: str) -> pd.DataFrame | None:
+    """Daily OHLC for any option underlying this lab trades, ETF or index --
+    the price series realized-vol signals are computed on.
+
+    ETF codes resolve to `Data/options/etf_daily_{code}.csv` (load_etf_ohlc,
+    written by updater.py); the three CFFEX index-option underlyings resolve
+    to `Data/index/index_daily_{code}.csv` (written by
+    index_price_updater.py). Same columns either way (date/open/close/high/
+    low/volume), so callers need no branch of their own.
+
+    Deliberately a separate function rather than widening load_etf_ohlc: an
+    index is not an ETF, and the two caches are written by different
+    updaters against different sources. Returns None when nothing is cached,
+    matching load_etf_ohlc's contract."""
+    df = load_etf_ohlc(underlying)
+    if df is not None:
+        return df
+    path = index_ohlc_path(underlying)
+    if not path.exists():
+        return None
+    idx = pd.read_csv(path)
+    idx["date"] = pd.to_datetime(idx["date"])
+    return idx.sort_values("date").reset_index(drop=True)
+
+
 def last_chain_date(underlying: str) -> pd.Timestamp | None:
     try:
         df = pd.read_csv(chain_path(underlying), encoding="utf-8-sig",
                          usecols=[C_DATE])
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
         return None
     if df.empty:
         return None
-    return pd.to_datetime(df[C_DATE]).max()
+    # errors="coerce": a stray corrupt row (unparseable date) must not make
+    # this look like "no date on file" -- that previously made append_chain
+    # skip its dedup/replace branch entirely and silently double-append.
+    parsed = pd.to_datetime(df[C_DATE], errors="coerce")
+    n_bad = parsed.isna().sum()
+    if n_bad:
+        print(f"[WARN] {chain_path(underlying).name}: {n_bad} row(s) with "
+              f"unparseable {C_DATE!r} -- ignoring for last_chain_date")
+    return parsed.max() if parsed.notna().any() else None
 
 
 def append_chain(underlying: str, rows: pd.DataFrame) -> int:

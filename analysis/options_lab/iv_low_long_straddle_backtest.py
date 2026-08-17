@@ -20,6 +20,24 @@ rather than a purely historical-percentile one -- e.g. it can fire even
 when IV's own percentile rank isn't at an extreme, if realized vol has
 quietly risen faster than IV has.
 
+--signal gex_pct / gex_mag_pct: rolling percentile of net (or unsigned
+magnitude) dealer gamma exposure (gamma_exposure.py) -- low/negative
+percentile = dealers structurally short gamma, the textbook backdrop for
+buying premium ahead of an expansion. Same signal already tested on the
+other 5 underlyings via long_straddle_rv_contraction_backtest.py; added
+here too so 510050/510300 get the same coverage on the long side that they
+already have on the short side (vol_rich_short_straddle_backtest.py).
+
+--signal flip_dist: raw signed distance of spot above the gamma flip point
+(gamma_flip.flip_distance_series) -- low/negative = spot below the flip
+point, the negative-gamma/vol-amplifying regime, the textbook backdrop for
+buying. 510050/510300 ONLY by construction (gamma_flip.py needs
+per-contract IV, only available for these two).
+
+--signal pc_oi_pct / pc_vol_pct: rolling percentile of the put/call
+open-interest or volume ratio (put_call_ratio.py) -- a positioning/
+sentiment signal, no a priori direction assumption.
+
 Unlike the naked short straddle, this needs NO margin -- long options are
 fully paid for at entry, so max loss is capped at the debit paid by
 construction (margin.py's compute_deposit correctly returns 0 for an
@@ -38,9 +56,20 @@ Follows this repo's established discovery/holdout discipline
 (condor_delta_investigation_summary.md): discovery 2015-02-09 -> 2023-12-31,
 holdout 2024-01-01 -> 2026-07-08, touched once.
 
+Look-ahead robustness note: default entry gating (lag_signal_days=0) uses the
+SAME trading date's signal value while pricing the trade at that same date's
+close -- not a true look-ahead (iv_pct/vrp are rolling/trailing functions of
+data through that date, never later dates), but a same-bar execution
+idealization applied less strictly than this repo's "rich/extreme" trigger
+family (calendar_spread_entry_timing_backtest.py,
+skew_vrp_combo_short_straddle_backtest.py), which gate on the PRIOR trading
+date's value. --lag-signal-days N reruns under that stricter convention as a
+robustness check.
+
 Usage:
     python iv_low_long_straddle_backtest.py --underlying 510300 --signal vrp
     python iv_low_long_straddle_backtest.py --underlying 510300 --signal vrp --sweep
+    python iv_low_long_straddle_backtest.py --underlying 510300 --signal vrp --lag-signal-days 1
 """
 from __future__ import annotations
 
@@ -57,6 +86,9 @@ import pandas as pd
 
 import backtest as bt
 import data_store as ds
+import gamma_exposure as gx
+import gamma_flip as gf
+import put_call_ratio as pc
 import quarterly_atm_short_straddle as qs
 
 OUT_DIR = Path(__file__).resolve().parent / "out"
@@ -74,8 +106,17 @@ C_RED = "#e34948"
 C_AQUA = "#1baf7a"
 
 # sweep grids (discovery-only search, frozen pick scored once on holdout)
-IV_PCT_MAXES = [0.05, 0.10, 0.20, 0.30]
-VRP_MAXES = [-0.06, -0.03, 0.0, 0.03]  # near-month ATM IV minus trailing RV, vol points
+SIGNAL_MAXES = {
+    "iv_pct": [0.05, 0.10, 0.20, 0.30],
+    "vrp": [-0.06, -0.03, 0.0, 0.03],  # near-month ATM IV minus trailing RV, vol points
+    "gex_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of net dealer GEX, mirror of iv_pct's grid
+    "gex_mag_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of |net dealer GEX|, unsigned fallback
+    "flip_dist": [-0.05, -0.03, -0.02, -0.01],  # raw signed distance above the gamma flip point
+    "pc_oi_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of put/call OI ratio
+    "pc_vol_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of put/call volume ratio
+}
+DEFAULT_THRESHOLD = {"iv_pct": 0.20, "vrp": 0.0, "gex_pct": 0.20, "gex_mag_pct": 0.20,
+                    "flip_dist": -0.02, "pc_oi_pct": 0.20, "pc_vol_pct": 0.20}
 MAX_HOLDS = [5, 10, 20, 30]
 PROFIT_TARGETS = [0.5, 1.0, 2.0, None]  # multiple of debit gained; None = no target, hold to max_hold/expiry
 RV_WINDOW = 20  # trailing trading days for the vrp signal's realized-vol side
@@ -102,10 +143,10 @@ def iv_pct_series(underlying: str) -> pd.Series:
 
 @lru_cache(maxsize=4)
 def _trailing_rv_series(underlying: str, window: int = RV_WINDOW) -> pd.Series:
-    etf = ds.load_etf_ohlc(underlying)
+    etf = ds.load_underlying_ohlc(underlying)
     if etf is None:
         raise FileNotFoundError(
-            f"no cached ETF OHLC for {underlying} -- run updater.py at least once")
+            f"no cached underlying OHLC for {underlying} -- run updater.py at least once")
     s = etf.set_index("date")["close"].sort_index()
     logret = np.log(s).diff()
     return logret.rolling(window, min_periods=15).std() * np.sqrt(252)
@@ -130,12 +171,23 @@ def _signal_series(underlying: str, signal: str) -> pd.Series:
         return iv_pct_series(underlying)
     if signal == "vrp":
         return vrp_trailing_series(underlying)
+    if signal == "gex_pct":
+        return gx.gex_pct_series(underlying)
+    if signal == "gex_mag_pct":
+        return gx.gex_magnitude_pct_series(underlying)  # unsigned fallback, see gamma_exposure.py
+    if signal == "flip_dist":
+        return gf.flip_distance_series(underlying)  # 510050/510300 only, see gamma_flip.py
+    if signal == "pc_oi_pct":
+        return pc.pc_oi_ratio_pct_series(underlying)
+    if signal == "pc_vol_pct":
+        return pc.pc_vol_ratio_pct_series(underlying)
     raise ValueError(f"unknown signal {signal!r}")
 
 
 # ------------------------------------------------------------------ engine
 def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
-       profit_target: float | None, dte_min: int = 10, dte_max: int = 45) -> dict:
+       profit_target: float | None, dte_min: int = 10, dte_max: int = 45,
+       lag_signal_days: int = 0) -> dict:
     chain = _prepped_chain(underlying)
     sig = _signal_series(underlying, signal)
 
@@ -192,8 +244,14 @@ def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
             continue
 
         # ---- entry: only when the signal is below threshold ("cheap") and a
-        # near-month expiry is in range
-        p = sig.get(dt, np.nan)
+        # near-month expiry is in range. lag_signal_days=0 (default) uses
+        # today's own signal value, same as always -- see the look-ahead
+        # robustness note in the module docstring.
+        if lag_signal_days and i < lag_signal_days:
+            p = np.nan
+        else:
+            sig_date = pd.Timestamp(dates[i - lag_signal_days]) if lag_signal_days else dt
+            p = sig.get(sig_date, np.nan)
         ok = (p == p) and p <= threshold
         if ok:
             expiries = sorted(day[ds.C_EXPIRY].unique())
@@ -307,12 +365,12 @@ def _cell_stats(trades: pd.DataFrame) -> dict:
     return {"n": len(trades), "mean_r": r.mean()}
 
 
-def sweep(underlying: str, signal: str) -> None:
-    thresholds = IV_PCT_MAXES if signal == "iv_pct" else VRP_MAXES
+def sweep(underlying: str, signal: str, lag_signal_days: int = 0) -> None:
+    thresholds = SIGNAL_MAXES[signal]
     rows = []
     for threshold, hold, pt in product(thresholds, MAX_HOLDS, PROFIT_TARGETS):
         res = run(underlying, signal=signal, threshold=threshold,
-                 max_hold_days=hold, profit_target=pt)
+                 max_hold_days=hold, profit_target=pt, lag_signal_days=lag_signal_days)
         trades = res["trades"]
         disc = trades[trades["entry_date"] < SPLIT_DATE] if not trades.empty else trades
         hold_ = trades[trades["entry_date"] >= SPLIT_DATE] if not trades.empty else trades
@@ -323,11 +381,12 @@ def sweep(underlying: str, signal: str) -> None:
                      "hold_n": h_stats["n"], "hold_mean_r": h_stats["mean_r"]})
 
     grid = pd.DataFrame(rows)
-    print(f"{underlying} [signal={signal}]: sweep grid ({len(grid)} cells), "
+    lag_suffix = f"_lag{lag_signal_days}" if lag_signal_days else ""
+    print(f"{underlying} [signal={signal}]{lag_suffix}: sweep grid ({len(grid)} cells), "
           f"discovery < {SPLIT_DATE.date()} <= holdout, MIN_CELL_N={MIN_CELL_N}")
 
     OUT_DIR.mkdir(exist_ok=True)
-    grid_out = OUT_DIR / f"iv_low_long_straddle_sweep_{underlying}_{signal}.csv"
+    grid_out = OUT_DIR / f"iv_low_long_straddle_sweep_{underlying}_{signal}{lag_suffix}.csv"
     grid.to_csv(grid_out, index=False)
     print(f"Full grid saved to {grid_out}")
 
@@ -350,12 +409,12 @@ def sweep(underlying: str, signal: str) -> None:
 
 # ------------------------------------------------------------------ main
 def main(underlying: str, signal: str, threshold: float, max_hold_days: int,
-        profit_target: float | None, do_sweep: bool) -> None:
+        profit_target: float | None, do_sweep: bool, lag_signal_days: int = 0) -> None:
     if do_sweep:
-        sweep(underlying, signal)
+        sweep(underlying, signal, lag_signal_days=lag_signal_days)
         return
     res = run(underlying, signal=signal, threshold=threshold,
-             max_hold_days=max_hold_days, profit_target=profit_target)
+             max_hold_days=max_hold_days, profit_target=profit_target, lag_signal_days=lag_signal_days)
     report(res, underlying, signal, threshold, max_hold_days, profit_target)
     out_path = OUT_DIR / f"iv_low_long_straddle_{underlying}_{signal}.png"
     plot(res, underlying, signal, out_path)
@@ -365,12 +424,19 @@ def main(underlying: str, signal: str, threshold: float, max_hold_days: int,
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--underlying", default="510300")
-    ap.add_argument("--signal", choices=["iv_pct", "vrp"], default="vrp",
+    ap.add_argument("--signal",
+                    choices=["iv_pct", "vrp", "gex_pct", "gex_mag_pct", "flip_dist",
+                             "pc_oi_pct", "pc_vol_pct"],
+                    default="vrp",
                     help="iv_pct: cheap relative to IV's own history. "
-                         "vrp: cheap relative to trailing realized vol.")
+                         "vrp: cheap relative to trailing realized vol. "
+                         "gex_pct/gex_mag_pct: dealer net gamma exposure low vs its own "
+                         "rolling history. "
+                         "flip_dist: spot's raw distance above the gamma flip point. "
+                         "pc_oi_pct/pc_vol_pct: put/call OI or volume ratio low vs its "
+                         "own rolling history.")
     ap.add_argument("--threshold", type=float, default=None,
-                    help="entry when signal <= this (default: 0.20 for iv_pct, "
-                         "0.0 for vrp)")
+                    help="entry when signal <= this (default: see DEFAULT_THRESHOLD)")
     ap.add_argument("--max-hold", type=int, default=20, dest="max_hold_days",
                     help="max trading days to hold before closing regardless of expiry")
     ap.add_argument("--profit-target", type=float, default=1.0,
@@ -381,9 +447,15 @@ if __name__ == "__main__":
     ap.add_argument("--sweep", action="store_true",
                     help="grid-search (threshold, max_hold, profit_target) on discovery, "
                          "score the frozen pick on holdout")
+    ap.add_argument("--lag-signal-days", type=int, default=0, dest="lag_signal_days",
+                    help="gate entry on the signal value from N trading days before the "
+                         "entry date instead of the entry date's own same-day value "
+                         "(default 0 = today's exact current behavior, unchanged). "
+                         "See module docstring's look-ahead robustness note.")
     args = ap.parse_args()
     pt = None if args.no_profit_target else args.profit_target
     threshold = args.threshold
     if threshold is None:
-        threshold = 0.20 if args.signal == "iv_pct" else 0.0
-    main(args.underlying, args.signal, threshold, args.max_hold_days, pt, args.sweep)
+        threshold = DEFAULT_THRESHOLD[args.signal]
+    main(args.underlying, args.signal, threshold, args.max_hold_days, pt, args.sweep,
+         lag_signal_days=args.lag_signal_days)

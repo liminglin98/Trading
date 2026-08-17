@@ -13,6 +13,19 @@ via --signal:
       to what's actually been happening," the same vrp definition
       iv_low_long_straddle_backtest.py uses (deliberately NOT vrp_analysis.py's
       forward-looking definition, which would be lookahead bias as a trigger).
+  gex_pct / gex_mag_pct: rolling percentile of net (or unsigned magnitude)
+      dealer gamma exposure (gamma_exposure.py) -- low/negative percentile
+      = dealers structurally short gamma, whose delta-hedging mechanically
+      amplifies moves, the textbook backdrop for buying premium ahead of an
+      expansion. Sign convention (dealers long calls, short puts) is an
+      industry-standard heuristic UNVERIFIED for this market -- see
+      gamma_exposure.py's module docstring. Summed across the FULL chain
+      (every strike/expiry), not just near-month ATM like rv_pct/iv_pct/vrp.
+      No flip_dist here -- gamma_flip.py only covers 510050/510300, tested
+      via iv_low_long_straddle_backtest.py instead.
+  pc_oi_pct / pc_vol_pct: rolling percentile of the put/call open-interest
+      or volume ratio (put_call_ratio.py) -- a positioning/sentiment
+      signal, no a priori direction assumption.
 
 Underlying spot (needed for ATM strike selection, IV inversion, and expiry
 settlement) is fetched via akshare fund_etf_hist_sina and cached at
@@ -30,9 +43,22 @@ discovery < 2024-01-01 <= holdout, split fixed once. Flag explicitly: 588000/
 any "win" there as thin-sample until more history accumulates, don't read a
 strong ratio as confidence.
 
+Look-ahead robustness note: default entry gating (lag_signal_days=0) uses the
+SAME trading date's signal value while pricing the trade at that same date's
+close -- not a true look-ahead (rv_pct/iv_pct/vrp are all rolling/trailing
+functions of data through that date, never later dates), but a same-bar
+execution idealization applied less strictly than this repo's "rich/extreme"
+trigger family (calendar_spread_entry_timing_backtest.py,
+skew_vrp_combo_short_straddle_backtest.py), which gate on the PRIOR trading
+date's value. --lag-signal-days N reruns under that stricter convention as a
+robustness check on the frozen picks feeding the live VOL_SIGNAL_ALERTS
+(alerts_core.py never calls run() directly, only _signal_series(), so this
+flag cannot affect the live alert regardless of default).
+
 Usage:
     python long_straddle_rv_contraction_backtest.py --underlying 510500 --signal iv_pct
     python long_straddle_rv_contraction_backtest.py --underlying all --signal vrp --sweep
+    python long_straddle_rv_contraction_backtest.py --underlying 510500 --signal rv_pct --lag-signal-days 1
 """
 from __future__ import annotations
 
@@ -47,16 +73,51 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import cffex_margin as cm
 import consolidated_store as cs
 import data_store as ds
+import gamma_exposure as gx
+import put_call_ratio as pc
 import quarterly_atm_short_straddle as qs
 
 OUT_DIR = Path(__file__).resolve().parent / "out"
 SPLIT_DATE = pd.Timestamp("2024-01-01")  # same split as condor_delta_investigation_summary.md
 
-UNDERLYINGS = {
+ETF_UNDERLYINGS = {
     "510500": "500ETF", "588000": "科创50ETF", "588080": "科创板50ETF",
     "159915": "创业板ETF", "159901": "深证100ETF",
+}
+# CFFEX index options (added 2026-08-17). They ride the same consolidated_store
+# chain and the same engine; what differs is the contract multiplier (100
+# yuan/index point vs. the ETF options' 10000) and which signals are
+# computable -- see _multiplier() and CFFEX_UNSUPPORTED_SIGNALS below.
+CFFEX_UNDERLYINGS = {
+    "000300": "沪深300 (IO)", "000852": "中证1000 (MO)", "000016": "上证50 (HO)",
+}
+UNDERLYINGS = {**ETF_UNDERLYINGS, **CFFEX_UNDERLYINGS}
+
+# ASCII names for matplotlib PNG titles: this environment's matplotlib has no
+# CJK-capable font (checked: 21 families, none with CJK coverage), so a
+# Chinese name in a title renders as tofu boxes. Only the CFFEX names are
+# mapped here -- the Chinese ETF names (创业板ETF etc.) have the same problem,
+# but that is pre-existing behaviour in the ETF charts and fixing it would
+# change output this change has no business touching.
+PLOT_NAMES = {"000300": "IO CSI300", "000852": "MO CSI1000", "000016": "HO SSE50"}
+
+# Signals that cannot be computed for a CFFEX index option, with the reason.
+# These are BLOCKED rather than left to fail on their own because both fail
+# SILENTLY on this dataset, which is far worse than an exception:
+#   gex_pct/gex_mag_pct -- ds.C_GAMMA is 0% populated for IO/MO/HO, and
+#     gamma_exposure.net_gex_series does chain[ds.C_GAMMA].fillna(0), so it
+#     returns an all-zero series whose rolling percentile rank is a CONSTANT
+#     ~0.508. A sweep over it produces a full grid of plausible-looking,
+#     entirely meaningless numbers.
+# (flip_dist is not in this module's dispatch at all; gamma_flip.py raises
+# on its own for anything outside 510050/510300.)
+CFFEX_UNSUPPORTED_SIGNALS = {
+    "gex_pct": "ds.C_GAMMA is 0% populated for CFFEX index options -- "
+               "net GEX would be identically zero and its percentile a constant",
+    "gex_mag_pct": "same as gex_pct: no per-contract gamma in this dataset",
 }
 
 # ---- palette (light mode; see dataviz skill references/palette.md) ----
@@ -74,12 +135,17 @@ SIGNAL_MAXES = {
     "rv_pct": [0.05, 0.10, 0.20, 0.30],
     "iv_pct": [0.05, 0.10, 0.20, 0.30],
     "vrp": [-0.06, -0.03, 0.0, 0.03],  # ATM IV minus trailing RV, vol points
+    "gex_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of net dealer GEX, mirror of rv_pct's grid
+    "gex_mag_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of |net dealer GEX|, unsigned fallback
+    "pc_oi_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of put/call OI ratio
+    "pc_vol_pct": [0.05, 0.10, 0.20, 0.30],  # rolling percentile of put/call volume ratio
 }
 MAX_HOLDS = [5, 10, 20, 30]
 PROFIT_TARGETS = [0.5, 1.0, 2.0, None]  # multiple of debit gained; None = hold to max_hold/expiry
 RV_WINDOW = 20  # trailing trading days for the realized-vol side of rv_pct/vrp
 MIN_CELL_N = 15
-DEFAULT_THRESHOLD = {"rv_pct": 0.20, "iv_pct": 0.20, "vrp": 0.0}
+DEFAULT_THRESHOLD = {"rv_pct": 0.20, "iv_pct": 0.20, "vrp": 0.0, "gex_pct": 0.20,
+                    "gex_mag_pct": 0.20, "pc_oi_pct": 0.20, "pc_vol_pct": 0.20}
 
 
 # ------------------------------------------------------------------ signal
@@ -92,10 +158,11 @@ def _prepped_chain(underlying: str) -> pd.DataFrame:
 
 @lru_cache(maxsize=8)
 def _trailing_rv_series(underlying: str, window: int = RV_WINDOW) -> pd.Series:
-    etf = ds.load_etf_ohlc(underlying)
+    etf = ds.load_underlying_ohlc(underlying)
     if etf is None:
         raise FileNotFoundError(
-            f"no cached ETF OHLC for {underlying} -- see consolidated_store.py")
+            f"no cached underlying OHLC for {underlying} -- run updater.py (ETFs) "
+            f"or index_price_updater.py (000300/000852/000016) at least once")
     s = etf.set_index("date")["close"].sort_index()
     logret = np.log(s).diff()
     return logret.rolling(window, min_periods=15).std() * np.sqrt(252)
@@ -129,19 +196,56 @@ def vrp_trailing_series(underlying: str, rv_window: int = RV_WINDOW) -> pd.Serie
     return (iv_atm.reindex(idx) - rv.reindex(idx)).dropna()
 
 
+def _multiplier(underlying: str) -> int:
+    """Contract multiplier in yuan per unit of underlying price. ETF options
+    are 10000 (ds.MULTIPLIER); CFFEX index options are 100 yuan per index
+    point (cffex_margin.MULTIPLIER, same for IO/MO/HO). Return-on-debit is a
+    ratio and so is unaffected, but every yuan-denominated figure in report()
+    and plot() is wrong by 100x if this is not dispatched."""
+    return cm.MULTIPLIER if underlying in CFFEX_UNDERLYINGS else ds.MULTIPLIER
+
+
+def _check_signal_supported(underlying: str, signal: str) -> None:
+    """Raise on a (underlying, signal) pair that would silently produce a
+    degenerate series -- see CFFEX_UNSUPPORTED_SIGNALS."""
+    if underlying in CFFEX_UNDERLYINGS and signal in CFFEX_UNSUPPORTED_SIGNALS:
+        raise ValueError(
+            f"signal {signal!r} is not available for CFFEX index option "
+            f"{underlying}: {CFFEX_UNSUPPORTED_SIGNALS[signal]}")
+
+
 def _signal_series(underlying: str, signal: str) -> pd.Series:
+    _check_signal_supported(underlying, signal)
     if signal == "rv_pct":
         return rv_pct_series(underlying)
     if signal == "iv_pct":
         return iv_pct_series(underlying)
     if signal == "vrp":
         return vrp_trailing_series(underlying)
+    if signal == "gex_pct":
+        return gx.gex_pct_series(underlying)
+    if signal == "gex_mag_pct":
+        return gx.gex_magnitude_pct_series(underlying)  # unsigned fallback, see gamma_exposure.py
+    if signal == "pc_oi_pct":
+        return pc.pc_oi_ratio_pct_series(underlying)
+    if signal == "pc_vol_pct":
+        return pc.pc_vol_ratio_pct_series(underlying)
     raise ValueError(f"unknown signal {signal!r}")
 
 
 # ------------------------------------------------------------------ engine
 def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
-       profit_target: float | None, dte_min: int = 10, dte_max: int = 45) -> dict:
+       profit_target: float | None, dte_min: int = 10, dte_max: int = 45,
+       lag_signal_days: int = 0, slippage: float = 0.0) -> dict:
+    """slippage (default 0.0, this lab's no-fees/no-slippage convention,
+    unchanged): adverse half-spread per leg, in underlying-price units
+    (index points for CFFEX, yuan for ETF options), charged on BOTH legs at
+    entry and at a close-based exit (profit_target/max_hold). NOT charged at
+    expiry -- cash settlement has no spread to cross, same convention
+    expiry_week_atm_straddle_backtest.py uses. profit_target/max_hold
+    triggers are still evaluated on the raw (unslipped) mark -- slippage
+    only affects what is actually realized once an exit fires, not whether
+    one fires, so timing stays comparable across the slippage grid."""
     chain = _prepped_chain(underlying)
     sig = _signal_series(underlying, signal)
 
@@ -182,13 +286,22 @@ def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
                     reason = "max_hold"
 
             if reason:
-                realized += pnl
+                # Realized proceeds net of exit friction. At slippage=0 both
+                # branches reduce to exactly `mark` (call_px/put_px are real
+                # prices, always >= 0, so max(x-0,0) == x) -- byte-identical
+                # to the pre-slippage behavior.
+                if reason == "expiry":
+                    proceeds = mark
+                else:
+                    proceeds = max(call_px - slippage, 0.0) + max(put_px - slippage, 0.0)
+                realized_pnl = proceeds - open_pos["cost"]
+                realized += realized_pnl
                 trades.append({
                     "entry_date": open_pos["entry_date"], "exit_date": dt,
                     "expiry": open_pos["expiry"], "exit_reason": reason,
                     "strike": open_pos["strike"], "entry_spot": open_pos["entry_spot"],
                     "exit_spot": spot, "signal_at_entry": open_pos["signal_at_entry"],
-                    "debit": open_pos["cost"], "pnl": pnl,
+                    "debit": open_pos["cost"], "pnl": realized_pnl,
                     "days_held": days_held,
                 })
                 open_pos = None
@@ -198,8 +311,17 @@ def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
             continue
 
         # ---- entry: only when the signal is below threshold ("cheap"/"quiet")
-        # and a near-month expiry is in range
-        p = sig.get(dt, np.nan)
+        # and a near-month expiry is in range. lag_signal_days=0 (default) uses
+        # today's own signal value, same as always -- see the look-ahead
+        # robustness note in the module docstring for why lag_signal_days>0
+        # exists (mirrors the dates[i-N] lookup pattern used for "rich/extreme"
+        # triggers elsewhere in this repo, e.g. calendar_spread_entry_timing_
+        # backtest.py, skew_vrp_combo_short_straddle_backtest.py).
+        if lag_signal_days and i < lag_signal_days:
+            p = np.nan
+        else:
+            sig_date = pd.Timestamp(dates[i - lag_signal_days]) if lag_signal_days else dt
+            p = sig.get(sig_date, np.nan)
         ok = (p == p) and p <= threshold
         if ok:
             expiries = sorted(day[ds.C_EXPIRY].unique())
@@ -216,7 +338,9 @@ def run(underlying: str, signal: str, threshold: float, max_hold_days: int,
                         "expiry": expiry, "strike": strike,
                         "call_code": call_row[ds.C_CODE], "put_code": put_row[ds.C_CODE],
                         "last_call_px": call_px, "last_put_px": put_px,
-                        "cost": call_px + put_px, "signal_at_entry": float(p),
+                        # entry friction on both legs (buying at the offer);
+                        # 0 at slippage=0, unchanged from before this param existed
+                        "cost": call_px + put_px + 2 * slippage, "signal_at_entry": float(p),
                     }
         equity_rows.append({"date": dt, "equity": realized, "open_pnl": 0.0, "spot": spot})
 
@@ -234,15 +358,16 @@ def report(res: dict, underlying: str, signal: str, threshold: float,
           max_hold_days: int, profit_target: float | None) -> None:
     trades, equity = res["trades"], res["equity"]
     name = UNDERLYINGS.get(underlying, underlying)
+    mult = _multiplier(underlying)
     if trades.empty:
         print(f"{underlying} ({name}) [{signal}]: no trades.")
         return
-    pnl_yuan = trades["pnl"] * ds.MULTIPLIER
-    eq = equity.set_index("date")["equity"] * ds.MULTIPLIER
+    pnl_yuan = trades["pnl"] * mult
+    eq = equity.set_index("date")["equity"] * mult
     dd = eq - eq.cummax()
     daily = eq.diff().dropna()
     sharpe = daily.mean() / daily.std() * np.sqrt(244) if daily.std() > 0 else np.nan
-    avg_debit = trades["debit"].mean() * ds.MULTIPLIER
+    avg_debit = trades["debit"].mean() * mult
     total_pnl = pnl_yuan.sum()
     span_years = (equity["date"].max() - equity["date"].min()).days / 365.25
     cagr_on_debit = (total_pnl / avg_debit) / span_years if span_years > 0 else np.nan
@@ -254,7 +379,7 @@ def report(res: dict, underlying: str, signal: str, threshold: float,
     print(f"  n_trades={len(trades)}  avg_days_held={trades['days_held'].mean():.1f}  "
           f"mean signal at entry={trades['signal_at_entry'].mean():.1%}")
     print(f"  total_pnl={total_pnl:,.0f} yuan  win_rate={(trades['pnl']>0).mean():.0%}  "
-          f"mean_r={(pnl_yuan/(trades['debit']*ds.MULTIPLIER)).mean():+.2%} (pnl/debit per trade)")
+          f"mean_r={(pnl_yuan/(trades['debit']*mult)).mean():+.2%} (pnl/debit per trade)")
     print(f"  avg_win={pnl_yuan[pnl_yuan>0].mean():,.0f}  "
           f"avg_loss={pnl_yuan[pnl_yuan<=0].mean():,.0f} yuan")
     print(f"  max_drawdown={dd.min():,.0f} yuan  sharpe(daily,ann)={sharpe:.2f}")
@@ -264,7 +389,7 @@ def report(res: dict, underlying: str, signal: str, threshold: float,
     trades["year"] = trades["entry_date"].dt.year
     print("  by year:")
     for yr, g in trades.groupby("year"):
-        print(f"    {yr}: n={len(g)}  pnl={g['pnl'].sum()*ds.MULTIPLIER:>10,.0f}  win%={(g['pnl']>0).mean():.0%}")
+        print(f"    {yr}: n={len(g)}  pnl={g['pnl'].sum()*mult:>10,.0f}  win%={(g['pnl']>0).mean():.0%}")
 
     OUT_DIR.mkdir(exist_ok=True)
     trades_out = OUT_DIR / f"long_straddle_trades_{underlying}_{signal}.csv"
@@ -274,8 +399,9 @@ def report(res: dict, underlying: str, signal: str, threshold: float,
 
 def plot(res: dict, underlying: str, signal: str, out_path: Path) -> None:
     equity = res["equity"]
-    name = UNDERLYINGS.get(underlying, underlying)
-    eq = equity.set_index("date")["equity"] * ds.MULTIPLIER
+    name = PLOT_NAMES.get(underlying, UNDERLYINGS.get(underlying, underlying))
+    mult = _multiplier(underlying)
+    eq = equity.set_index("date")["equity"] * mult
     dd = eq - eq.cummax()
 
     fig, (ax1, ax2) = plt.subplots(
@@ -314,12 +440,12 @@ def _cell_stats(trades: pd.DataFrame) -> dict:
     return {"n": len(trades), "mean_r": r.mean()}
 
 
-def sweep(underlying: str, signal: str) -> None:
+def sweep(underlying: str, signal: str, lag_signal_days: int = 0) -> None:
     thresholds = SIGNAL_MAXES[signal]
     rows = []
     for threshold, hold, pt in product(thresholds, MAX_HOLDS, PROFIT_TARGETS):
         res = run(underlying, signal=signal, threshold=threshold,
-                 max_hold_days=hold, profit_target=pt)
+                 max_hold_days=hold, profit_target=pt, lag_signal_days=lag_signal_days)
         trades = res["trades"]
         disc = trades[trades["entry_date"] < SPLIT_DATE] if not trades.empty else trades
         hold_ = trades[trades["entry_date"] >= SPLIT_DATE] if not trades.empty else trades
@@ -331,11 +457,12 @@ def sweep(underlying: str, signal: str) -> None:
 
     grid = pd.DataFrame(rows)
     name = UNDERLYINGS.get(underlying, underlying)
-    print(f"{underlying} ({name}) [{signal}]: sweep grid ({len(grid)} cells), "
+    lag_suffix = f"_lag{lag_signal_days}" if lag_signal_days else ""
+    print(f"{underlying} ({name}) [{signal}]{lag_suffix}: sweep grid ({len(grid)} cells), "
           f"discovery < {SPLIT_DATE.date()} <= holdout, MIN_CELL_N={MIN_CELL_N}")
 
     OUT_DIR.mkdir(exist_ok=True)
-    grid_out = OUT_DIR / f"long_straddle_sweep_{underlying}_{signal}.csv"
+    grid_out = OUT_DIR / f"long_straddle_sweep_{underlying}_{signal}{lag_suffix}.csv"
     grid.to_csv(grid_out, index=False)
     print(f"Full grid saved to {grid_out}")
 
@@ -359,14 +486,22 @@ def sweep(underlying: str, signal: str) -> None:
 
 # ------------------------------------------------------------------ main
 def main(underlying: str, signal: str, threshold: float, max_hold_days: int,
-        profit_target: float | None, do_sweep: bool) -> None:
+        profit_target: float | None, do_sweep: bool, lag_signal_days: int = 0) -> None:
     targets = list(UNDERLYINGS) if underlying == "all" else [underlying]
     for u in targets:
+        # "all" means "this signal, across every underlying that can compute
+        # it" -- an underlying the signal is unavailable for is skipped with
+        # the reason, not allowed to abort the whole batch. An explicitly
+        # named underlying still raises, so a typo is never silently ignored.
+        if underlying == "all" and u in CFFEX_UNDERLYINGS and signal in CFFEX_UNSUPPORTED_SIGNALS:
+            print(f"{u} ({UNDERLYINGS[u]}) [{signal}]: skipped -- "
+                  f"{CFFEX_UNSUPPORTED_SIGNALS[signal]}\n")
+            continue
         if do_sweep:
-            sweep(u, signal)
+            sweep(u, signal, lag_signal_days=lag_signal_days)
             continue
         res = run(u, signal=signal, threshold=threshold, max_hold_days=max_hold_days,
-                 profit_target=profit_target)
+                 profit_target=profit_target, lag_signal_days=lag_signal_days)
         report(res, u, signal, threshold, max_hold_days, profit_target)
         out_path = OUT_DIR / f"long_straddle_{u}_{signal}.png"
         plot(res, u, signal, out_path)
@@ -377,10 +512,19 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--underlying", default="all",
                     choices=list(UNDERLYINGS) + ["all"])
-    ap.add_argument("--signal", choices=["rv_pct", "iv_pct", "vrp"], default="rv_pct",
+    ap.add_argument("--signal",
+                    choices=["rv_pct", "iv_pct", "vrp", "gex_pct", "gex_mag_pct",
+                             "pc_oi_pct", "pc_vol_pct"],
+                    default="rv_pct",
                     help="rv_pct: trailing RV cheap vs its own history. "
                          "iv_pct: ATM IV (Black-Scholes-inverted) cheap vs its own history. "
-                         "vrp: ATM IV minus trailing RV.")
+                         "vrp: ATM IV minus trailing RV. "
+                         "gex_pct/gex_mag_pct: dealer net gamma exposure LOW vs its own "
+                         "rolling history -- short-gamma dealers amplify vol (see "
+                         "gamma_exposure.py's module docstring for the unverified sign "
+                         "convention). "
+                         "pc_oi_pct/pc_vol_pct: put/call OI or volume ratio LOW vs its "
+                         "own rolling history.")
     ap.add_argument("--threshold", type=float, default=None,
                     help="entry when signal <= this (default: 0.20 for rv_pct/iv_pct, "
                          "0.0 for vrp)")
@@ -394,7 +538,13 @@ if __name__ == "__main__":
     ap.add_argument("--sweep", action="store_true",
                     help="grid-search (threshold, max_hold, profit_target) on discovery, "
                          "score the frozen pick on holdout")
+    ap.add_argument("--lag-signal-days", type=int, default=0, dest="lag_signal_days",
+                    help="gate entry on the signal value from N trading days before the "
+                         "entry date instead of the entry date's own same-day value "
+                         "(default 0 = today's exact current behavior, unchanged). "
+                         "See module docstring's look-ahead robustness note.")
     args = ap.parse_args()
     pt = None if args.no_profit_target else args.profit_target
     threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD[args.signal]
-    main(args.underlying, args.signal, threshold, args.max_hold_days, pt, args.sweep)
+    main(args.underlying, args.signal, threshold, args.max_hold_days, pt, args.sweep,
+         lag_signal_days=args.lag_signal_days)
