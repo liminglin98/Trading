@@ -404,7 +404,46 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
     build_four_panel_figure() used to lay the rows out initially --
     FOUR_PANEL_ROW_HEIGHTS/FOUR_PANEL_VSPACING, hardcoded into the JS below
     rather than left to drift from the Python constants. Refuses to hide
-    the last visible panel."""
+    the last visible panel.
+
+    This toggle mechanism has been the site of three distinct, real bugs,
+    found over two rounds of direct DOM/Plotly-internals inspection (not
+    guesswork -- every claim below was checked live in a browser, not
+    inferred from reading Plotly's source). All three are worked around
+    below; see the inline comments at each fix for the isolating tests that
+    pinned each one down.
+
+    1. Collapsing a row's yaxis.domain to zero height is correctly applied
+       to that axis's own domain and to every row's trace geometry -- but
+       Plotly.js does NOT recompute that axis's internal
+       `_fullLayout.yaxisN._length` (the pixel length it uses to lay out
+       that axis's OWN tick labels). The stale nonzero _length makes the
+       hidden row keep drawing a full column of tick-label text that
+       sprawls across and overlaps the still-visible rows, even though
+       gd.layout, gd.data, and the actual plotted trace positions all read
+       back as correct. Reproduces for ANY hidden row (edge or sandwiched
+       alike). Fix: explicitly hide the axis itself (`.visible =
+       visible[i]` in apply()'s phase 2), which suppresses its tick-label
+       rendering regardless of the stale _length cache.
+
+    2. That DOM-level fix alone was found NOT sufficient: even with the DOM
+       fully correct (empty tick-label layer, confirmed), the corruption
+       could still show on screen, because Chrome's GPU compositor can keep
+       painting STALE pixels for that region. A forced DOM reflow does not
+       clear it; a JS-triggered window.scrollBy() does not clear it; an
+       actual mouse scroll gesture (real browser input, not script) does,
+       and so does Plotly.Plots.resize(gd). Fix: apply() calls resize()
+       right after the corrected domains/visibility settle, which reliably
+       forces the repaint without perturbing them (verified).
+
+    3. A third, unrelated bug, found afterward while re-verifying the above
+       two on a fresh browser session: a truly degenerate (zero or
+       near-zero height) yaxis.domain, combined with MULTIPLE axes' domains
+       changing in the same react() call -- which is exactly what
+       apply()'s phase 2 always does -- corrupts bar-trace rendering
+       FIGURE-WIDE, blanking bars even in unrelated, unchanged rows. See
+       ZERO_DOMAIN_EPS below for the isolating tests and the fix (never use
+       a truly-zero-height domain for a collapsed row)."""
     return f"""
     (function() {{
         var gd = document.getElementById({json.dumps(div_id)});
@@ -413,6 +452,29 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
         var LABELS = {json.dumps(panel_labels)};
         var N = WEIGHTS.length;
         var visible = WEIGHTS.map(function() {{ return true; }});
+
+        // Third root cause, found the same way as the other two (direct
+        // inspection, bisecting every variable individually rather than
+        // guessing): apply()'s phase 2 always changes ALL FOUR yaxisN.domain
+        // values in one react() call (computeDomains() recomputes every row,
+        // even ones that didn't toggle). When one of those four domains is
+        // truly degenerate -- height exactly 0, or even a barely-nonzero
+        // sliver like 0.0001 -- Plotly.js corrupts bar-trace rendering
+        // FIGURE-WIDE: bars vanish even in completely unrelated, unchanged
+        // rows. Isolated individually: a single axis's domain going fully to
+        // [x,x] with every other axis untouched -- also breaks it. A single
+        // axis at a small-but-not-tiny sliver with every other axis
+        // untouched -- fine on its own. Multiple NORMAL-sized domains
+        // changing together in one call -- also fine. It's specifically the
+        // combination of (multiple axes changing at once) + (one of them
+        // near-zero) that corrupts rendering; resize(), axis.visible,
+        // react() vs newPlot(), and DOM node reuse were all ruled out
+        // individually as the cause. Empirically, 0.0001 was still small
+        // enough to trigger it and 0.01 was safely clear of it; 0.002 (used
+        // below) was verified clear too and is small enough to be visually
+        // indistinguishable from a true collapse. Every "collapsed" domain
+        // in this file uses this epsilon instead of a true [x, x] pair.
+        var ZERO_DOMAIN_EPS = 0.002;
 
         function computeDomains() {{
             var visIdx = [];
@@ -432,7 +494,7 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
                     top = y0 - VSPACE;
                 }} else {{
                     var flat = Math.max(top, 0);
-                    domains.push([flat, flat]);
+                    domains.push([flat, Math.min(flat + ZERO_DOMAIN_EPS, 1)]);
                     titleY.push(null);
                 }}
             }}
@@ -463,28 +525,20 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
                 }}
             }}
 
-            // Confirmed (by the user, precisely): sequential/adjacent toggles
-            // -- shrinking or growing the visible set from either end -- work
-            // every time, however fast. A toggle that leaves a HIDDEN row
-            // sandwiched between two still-visible ones (a "gap" in the
-            // visible set, e.g. hiding row 2 while 0/1/3 stay visible) fails
-            // every time, regardless of click history -- ruling out an
-            // async-timing or cold-start explanation, both tested and ruled
-            // out above. That is a very specific reproduction signature, and
-            // Plotly.react() with ALL FOUR axes' domains changed in one call
-            // (verified correct data going in, still mispainted coming out)
-            // hasn't dodged it. This splits every toggle into two react()
-            // calls: phase 1 changes ONLY the clicked row's own domain
-            // (collapsing it in place) and its trace visibility -- every
-            // OTHER row's domain is left untouched, so this call can never
-            // itself create a "gap" pattern in one shot. Phase 2, once that
-            // settles, applies the full correct redistribution across all
-            // rows. This costs one extra redraw but turns the single
-            // gap-creating jump into two smaller, boundary-shaped changes --
-            // closer to what naturally-sequential clicking already does
-            // without issue.
+            // The two-phase react() split below predates root-causing this
+            // bug and does not, by itself, fix it -- kept anyway since it's
+            // harmless and the isolated-first-phase update is still a
+            // reasonable thing to do. The actual fix is `.visible = visible[i]`
+            // on each axis in phase 2, below: collapsing a row's yaxis.domain
+            // to zero height alone leaves Plotly's internal per-axis
+            // `_length` cache (used to lay out that axis's OWN tick labels)
+            // stale and nonzero, so the hidden row keeps drawing a full
+            // column of tick-label text that overlaps the visible rows --
+            // see this function's docstring for the full root-cause writeup.
+            // Explicitly hiding the axis suppresses its tick-label rendering
+            // regardless of that stale cache.
             var current = gd.layout[axisNames[changedIdx]].domain.slice();
-            var phase1Domain = visible[changedIdx] ? current : [current[0], current[0]];
+            var phase1Domain = visible[changedIdx] ? current : [current[0], Math.min(current[0] + ZERO_DOMAIN_EPS, 1)];
             gd.layout[axisNames[changedIdx]].domain = phase1Domain;
             console.log('[panel-toggle] PHASE 1 (isolated single-row change) idx=', changedIdx,
                         'domain=', JSON.stringify(phase1Domain));
@@ -493,12 +547,32 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
                 var r = computeDomains();
                 for (var i = 0; i < N; i++) {{
                     gd.layout[axisNames[i]].domain = r.domains[i];
+                    gd.layout[axisNames[i]].visible = visible[i];
                     gd.layout.annotations[i].opacity = visible[i] ? 1 : 0;
                     if (visible[i]) gd.layout.annotations[i].y = r.titleY[i];
                 }}
                 console.log('[panel-toggle] PHASE 2 (full redistribution) visible=', JSON.stringify(visible),
                             'domains=', JSON.stringify(r.domains));
                 return Plotly.react(gd, gd.data, gd.layout);
+            }}).then(function() {{
+                // Second root cause, found the same way as the axis.visible one
+                // above (direct inspection, not guesswork): even after the DOM
+                // is fully correct -- yaxisN.domain right, axis.visible right,
+                // that axis's tick-label layer literally empty -- Chrome's own
+                // GPU compositor can keep showing STALE PAINTED PIXELS for the
+                // affected screen region, because attribute-only SVG changes
+                // here don't always get flagged as needing re-rasterization.
+                // Confirmed directly: forcing a DOM reflow (display:none/block)
+                // does NOT clear it; a JS-triggered window.scrollBy() does NOT
+                // clear it; only a REAL scroll gesture, or Plotly.Plots.resize(),
+                // reliably forces the compositor to re-tile the region. Calling
+                // resize() here -- after the correct domains/visibility are
+                // already set, not before -- does not perturb them (verified),
+                // so this is safe despite the removal note further down about
+                // resize() being a stale-container-size suspect; that concern
+                // was about calling it BEFORE the custom domains are applied,
+                // which doesn't happen here.
+                return Plotly.Plots.resize(gd);
             }}).then(function() {{
                 // What Plotly itself actually holds AFTER applying the update --
                 // if this doesn't match what was sent above, something inside
@@ -584,16 +658,15 @@ def build_panel_toggle_script(panel_labels: list[str], div_id: str) -> str:
             }})(i);
         }}
         gd.parentNode.insertBefore(bar, gd);
-        // NOTE: previously called Plotly.Plots.resize(gd) here (added when the
-        // figure had no explicit height and depended on the container's own
-        // size). Removed: the figure now always has an explicit layout.height
-        // (see build_four_panel_figure), so nothing here needs Plotly to
-        // re-measure the container -- and resize() is a heavy, non-domain-
-        // aware operation that may have been clobbering the custom per-row
-        // yaxis.domain layout this script depends on, which would only show
-        // up later, on the first toggle() call that layers a domain change on
-        // top of whatever resize() left behind. Left as a comment rather than
-        // silently deleted since this is a real suspect, not a cosmetic edit.
+        // Historical note, now resolved: this used to call Plotly.Plots.resize(gd)
+        // right here at setup time (when the figure had no explicit height), and
+        // that call was removed on suspicion it clobbered the custom per-row
+        // yaxis.domain layout on later toggles. That suspicion turned out to be
+        // about ordering, not the call itself: resize() called BEFORE the custom
+        // domains are applied can undo them, but resize() called AFTER they're
+        // applied does not (verified) -- and is in fact required, as a fix for a
+        // real stale-GPU-paint bug; see apply()'s phase 2, which now calls it at
+        // the right point in the sequence.
     }})();
     """
 
