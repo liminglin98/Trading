@@ -202,7 +202,9 @@ def _resolve_trigger(row: dict, near: dict) -> tuple[str, float, str] | None:
 
 
 def build_watchlist(chain_loader=None) -> list[dict]:
-    """Today's near-trigger rows, resolved down to the specific ATM
+    """Every currently-inactive, live-trackable alert row (not just ones
+    already near their threshold at the open -- see
+    alerts_core.full_trigger_detail), resolved down to the specific ATM
     contracts to poll live and the raw IV-point level that would flip each
     one active -- ready for check_triggers() to compare against
     minute_updater's feed all day."""
@@ -218,7 +220,7 @@ def build_watchlist(chain_loader=None) -> list[dict]:
         positions = ac.position_detail(row, chain_loader=chain_loader, idx_sh_series=idx_sh)
         if len(positions or []) >= ac.MAX_CONCURRENT_POSITIONS:
             continue
-        near = ac.near_trigger_detail(row)
+        near = ac.full_trigger_detail(row)
         if not near:
             continue
 
