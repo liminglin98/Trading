@@ -63,6 +63,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dtime
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -90,6 +91,19 @@ CLOSE_CUTOFF = dtime(15, 1)  # small buffer past the 15:00 window to catch the l
 DEFAULT_INTERVAL = 60
 
 COLUMNS = ["timestamp", "code", "cp", "strike", "dte", "spot", "bid", "ask", "last", "volume", "oi"]
+
+CN_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def now_cn() -> datetime:
+    """Wall-clock time in China local time, as a naive datetime -- SESSION_WINDOWS/
+    CLOSE_CUTOFF above are China-local by convention, and every comparison
+    against them (and every 'today' used for CSV filenames/timestamps) needs
+    to use this instead of bare datetime.now()/date.today(): this project's
+    Ubuntu server runs on UTC system time (see SERVER_CRON_SETUP.md), 8
+    hours off Beijing, so an un-converted datetime.now() would never
+    correctly detect market hours there."""
+    return datetime.now(CN_TZ).replace(tzinfo=None)
 
 
 def _f(x, default=float("nan")):
@@ -186,9 +200,9 @@ def resolve_etf_universe(underlyings: list[str]) -> dict[str, dict]:
 
 def snap_etf(underlying: str, meta: dict, dry_run: bool) -> int:
     spot, _ = U.etf_quote(underlying)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_cn().strftime("%Y-%m-%d %H:%M:%S")
     quotes = U._hq_batch([f"CON_OP_{c}" for c, _ in meta["codes"]])
-    today = date.today()
+    today = now_cn().date()
     rows = []
     for code, yymm in meta["codes"]:
         q = quotes.get(f"CON_OP_{code}")
@@ -233,9 +247,9 @@ def index_spot(underlying: str) -> float:
 def snap_index(underlying: str, months: list[str], dry_run: bool) -> int:
     import akshare as ak
     spot = index_spot(underlying)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_cn().strftime("%Y-%m-%d %H:%M:%S")
     fn = getattr(ak, INDEX_SPOT_FN[underlying])
-    today = date.today()
+    today = now_cn().date()
     rows = []
     for m in months:
         try:
@@ -265,7 +279,7 @@ def snap_index(underlying: str, months: list[str], dry_run: bool) -> int:
 
 # ------------------------------------------------------------------ output
 def minute_csv_path(underlying: str, is_index: bool, when: date | None = None) -> Path:
-    when = when or date.today()
+    when = when or now_cn().date()
     prefix = "index_option_minute" if is_index else "option_minute"
     return DATA_DIR / f"{prefix}_{underlying}_{when.strftime('%Y%m%d')}.csv"
 
@@ -319,7 +333,7 @@ def _safe_snap_index(u: str, months: list[str], dry_run: bool) -> int:
 
 def run(etf_underlyings: list[str], index_underlyings: list[str],
         interval: int = DEFAULT_INTERVAL, dry_run: bool = False, once: bool = False) -> None:
-    today = date.today()
+    today = now_cn().date()
     if not once and not is_trading_day(today):
         print(f"{today} is not a trading day -- exiting.")
         return
@@ -330,7 +344,7 @@ def run(etf_underlyings: list[str], index_underlyings: list[str],
 
     print(f"Entering polling loop (interval={interval}s, dry_run={dry_run})...")
     while True:
-        now = datetime.now()
+        now = now_cn()
         if now.date() != today:
             print("date rolled over -- exiting.")
             break
