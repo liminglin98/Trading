@@ -123,7 +123,7 @@ def day_trade(path: Path, underlying: str) -> dict | None:
     }
 
 
-def main():
+def main(min_dte: int = 1):
     files = sorted(MINUTE_DIR.glob("*.csv"))
     matched = [(f, m) for f in files if (m := FILE_RE.match(f.name))]
     print(f"{len(matched)} minute files found under {MINUTE_DIR}")
@@ -154,9 +154,13 @@ def main():
           f"collapses toward zero by the close almost by construction there (extreme gamma/pin risk, "
           f"not a normal representative day). Excluded from the headline below and reported separately.")
     zero_dte = trades[trades["dte"] == 0]
-    core = trades[trades["dte"] > 0].copy()
+    core = trades[trades["dte"] >= min_dte].copy()
+    dte_label = f"dte>={min_dte}" if min_dte > 1 else "dte>0"
+    n_dropped = len(trades[(trades["dte"] > 0) & (trades["dte"] < min_dte)])
+    if min_dte > 1:
+        print(f"Filtering further to {dte_label}: drops {n_dropped} more trades with 0 < dte < {min_dte}.")
 
-    print("\n=== Frictionless (mid-to-mid) vs bid/ask-crossed, by underlying (dte>0 only) ===")
+    print(f"\n=== Frictionless (mid-to-mid) vs bid/ask-crossed, by underlying ({dte_label}) ===")
     print("Return on premium collected (positive = short-straddle profit)\n")
     summary = core.groupby("underlying").agg(
         n=("file", "nunique"),
@@ -169,7 +173,7 @@ def main():
     summary["spread_cost_ret"] = summary["spread_cost_ret"] / core.groupby("underlying")["premium_mid"].mean()
     print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
 
-    print("\n=== Pooled across all underlyings/days (dte>0 only) ===")
+    print(f"\n=== Pooled across all underlyings/days ({dte_label}) ===")
     print(f"n = {len(core)}")
     print(f"Frictionless: mean return/trade = {core['mid_ret'].mean():+.2%}, "
           f"win rate = {(core['mid_pnl'] > 0).mean():.1%}, "
@@ -185,7 +189,7 @@ def main():
               f"{zero_dte['friction_ret'].mean():+.2%}, win rate = {(zero_dte['friction_pnl'] > 0).mean():.1%} "
               f"-- do not extrapolate from this, n={n_0dte}.")
 
-    print("\n=== Days-to-expiry sensitivity (bid/ask-crossed, dte>0) ===")
+    print(f"\n=== Days-to-expiry sensitivity (bid/ask-crossed, {dte_label}) ===")
     bins = [(1, 3, "1-3 dte"), (4, 7, "4-7 dte"), (8, 14, "8-14 dte"), (15, 999, "15+ dte")]
     for lo, hi, label in bins:
         sub = core[(core["dte"] >= lo) & (core["dte"] <= hi)]
@@ -194,7 +198,7 @@ def main():
         print(f"{label:<10} n={len(sub):>4}  friction_ret={sub['friction_ret'].mean():+.2%}  "
               f"win={(sub['friction_pnl'] > 0).mean():.1%}")
 
-    print("\n=== Commission sensitivity (added on top of the bid/ask-crossed fill, dte>0) ===")
+    print(f"\n=== Commission sensitivity (added on top of the bid/ask-crossed fill, {dte_label}) ===")
     print("Commission grid = per leg, per side (so round-trip straddle = 4x the figure)\n")
     header = "  ".join(f"{c:>8.1f}" for c in COMMISSION_GRID_YUAN)
     print(f"{'underlying':<12}{header}")
@@ -219,12 +223,27 @@ def main():
             cells.append(f"{(net_yuan > 0).mean():>8.1%}")
         print(f"{u:<12}" + "  ".join(cells))
 
+    ret_header = "  ".join(f"{c:>8.1f}" for c in COMMISSION_GRID_YUAN)
+    print(f"\n{'underlying':<12}{ret_header}   (mean net return/premium after commission)")
+    for u, g in core.groupby("underlying"):
+        cells = []
+        for c in COMMISSION_GRID_YUAN:
+            net_ret = (g["friction_pnl_yuan"] - 4 * c) / (g["premium_mid"] * g["multiplier"])
+            cells.append(f"{net_ret.mean():>+8.2%}")
+        print(f"{u:<12}" + "  ".join(cells))
+
     out_dir = Path(__file__).parent / "out"
     out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / "intraday_short_straddle_trades.csv"
+    out_path = out_dir / f"intraday_short_straddle_trades.csv"
     trades.to_csv(out_path, index=False)
     print(f"\nSaved trade-level table to {out_path}")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--min-dte", type=int, default=1,
+                     help="minimum days-to-expiry for the front-month contract at entry (default 1, i.e. "
+                          "everything except same-day expiry). Try 10+ to avoid near-expiry gamma/pin risk.")
+    args = ap.parse_args()
+    main(min_dte=args.min_dte)
