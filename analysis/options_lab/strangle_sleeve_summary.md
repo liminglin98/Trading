@@ -28,7 +28,7 @@ poor everywhere; 510300 hold-to-expiry arms are strong (d5% 0.348 rpd) but 51005
 roll rule is consistently best.
 
 ## What the sleeve is and is not
-* Return per margin is comparable to the straddle (and above it on 510050 2015+ and 510300), at similar monthly turnover cost.
+* Return per margin is comparable to the straddle (and above it on 510050 2015+ and 510300), net of the measured-spread costs charged here.
 * It is not a diversifier: monthly P&L correlation 0.59-0.67 (daily 0.63-0.75); it lost money in 7-8 of the straddle's 10
   worst months (mean -1.3k to -1.9k per lot), and its own worst month is -6.0k to -9.4k per lot.
 * Adding it improves ann return at 15% DD by only +0.2 to +0.5 pt where P2 passes, and the combined worst-20-day is
