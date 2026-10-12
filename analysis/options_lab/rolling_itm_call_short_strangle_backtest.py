@@ -148,7 +148,8 @@ def intrinsic(cp: str, k: float, s: float) -> float:
 
 
 # ------------------------------------------------------------------ engine
-def simulate(by_date: dict, dates: list, d: float, short_roll: str, long_roll: int) -> dict:
+def simulate(by_date: dict, dates: list, d: float, short_roll: str, long_roll: int,
+             roll_dte: int = 7, with_long: bool = True) -> dict:
     n = len(dates)
     legs = {"L": None, "C": None, "P": None}
     cash = {"L": 0.0, "S": 0.0}
@@ -188,7 +189,7 @@ def simulate(by_date: dict, dates: list, d: float, short_roll: str, long_roll: i
             else:
                 leg["last"] = float(rows.at[leg["code"], ds.C_CLOSE])
                 dte = (leg["expiry"] - dt).days
-                if (role == "L" and dte <= long_roll) or (role != "L" and short_roll == "7dte" and dte <= 7):
+                if (role == "L" and dte <= long_roll) or (role != "L" and short_roll == "7dte" and dte <= roll_dte):
                     close(role, leg["last"], dte)
 
         def open_(leg, role):
@@ -198,7 +199,7 @@ def simulate(by_date: dict, dates: list, d: float, short_roll: str, long_roll: i
             cash[comp] -= leg["qty"] * leg["px"]
             fills.append((i, comp, "long" if role == "L" else "short", (leg["expiry"] - dt).days))
 
-        if legs["L"] is None:
+        if legs["L"] is None and with_long:
             sel = pick_long(day, dt)
             if sel:
                 open_(sel, "L")
